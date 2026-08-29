@@ -14,6 +14,7 @@ import {
     deleteAccount,
 } from "../src/registry/accountsFile.js";
 import { sessionManager } from "../src/telegram/sessionManager.js";
+import { authStatus } from "../src/telegram/auth.js";
 
 test("json: writeJson/readJson round-trip с 0600", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "apigram-"));
@@ -59,4 +60,23 @@ test("sessionManager: channel создаётся единожды и чисти�
     assert.equal(got, 1);
     sessionManager.release("acc_x");
     assert.equal(sessionManager.channels.has("acc_x"), false);
+});
+
+test("auth: authStatus по состояниям", () => {
+    assert.deepEqual(authStatus({ status: "authorized", me: { id: "1" } }), {
+        status: "authorized",
+        me: { id: "1" },
+    });
+    assert.deepEqual(authStatus({ status: "awaiting_2fa" }), {
+        status: "awaiting_2fa",
+        next: "password",
+    });
+    assert.deepEqual(authStatus({ status: "code_sent" }), {
+        status: "code_sent",
+        next: "code",
+    });
+    assert.deepEqual(authStatus({ status: "no_session" }), {
+        status: "no_session",
+        next: "phone",
+    });
 });
