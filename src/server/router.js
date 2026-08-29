@@ -1,5 +1,6 @@
 import { Router } from "express";
-import { makeAccount, toPublic, accountStore } from "./accounts.js";
+import { makeAccount, removeAccount, toPublic, accountStore } from "./accounts.js";
+import { isAdmin, bearerToken } from "./bearer.js";
 import { sessionManager } from "../telegram/sessionManager.js";
 import * as authApi from "../telegram/auth.js";
 import * as msg from "../telegram/messages.js";
@@ -10,28 +11,40 @@ import * as prof from "../telegram/profile.js";
 export function buildRouter() {
     const r = Router();
 
-    // Создание аккаунта (без токена — выдаём новый). Токен отдаём в ответе один раз.
+    // Создание аккаунта. Токен отдаём в ответе один раз — больше он нигде не показывается.
     r.post("/accounts", (req, res) => {
+        if (!isAdmin(req)) return res.status(401).json({ error: "admin_token_required" });
         const account = makeAccount(req.body?.name || "");
         res.status(201).json({ ...toPublic(account), apiToken: account.apiToken });
+    });
+
+    r.delete("/accounts/:accountId", async (req, res, next) => {
+        try {
+            await sessionManager.detach(req.account.accountId);
+            const ok = removeAccount(req.account.accountId, bearerToken(req));
+            res.json({ ok });
+        } catch (err) { next(err); }
     });
 
     // ── Авторизация ───────────────────────────────────────────────
     r.post("/accounts/:accountId/auth/send-code", async (req, res, next) => {
         try {
             const { phone } = req.body || {};
-            if (!phone) return res.status(400).json({ error: "phone_required" });
+            if (!phone) return res.status(400).json({ error: "phone_required", step: "send-code" });
             const result = await authApi.sendCode(req.account, phone);
-            accountStore.saveAuthorized(req.account.accountId, { phone, status: "code_sent",
-                auth: { phoneCodeHash: result.codeHash } });
-            res.json({ ok: true, isCodeViaApp: result.isCodeViaApp });
+            accountStore.saveAuthorized(req.account.accountId, {
+                phone,
+                status: "code_sent",
+                auth: { phoneCodeHash: null },
+            });
+            res.json({ ok: true, isCodeViaApp: result.isCodeViaApp, next: "code" });
         } catch (err) { next(err); }
     });
 
     r.post("/accounts/:accountId/auth/verify-code", async (req, res, next) => {
         try {
             const { code } = req.body || {};
-            if (!code) return res.status(400).json({ error: "code_required" });
+            if (!code) return res.status(400).json({ error: "code_required", step: "verify-code" });
             const result = await authApi.verifyCode(req.account, accountStore, code);
             if (result.next === "password") {
                 accountStore.saveAuthorized(req.account.accountId, { status: "awaiting_2fa" });
@@ -44,7 +57,7 @@ export function buildRouter() {
     r.post("/accounts/:accountId/auth/password", async (req, res, next) => {
         try {
             const { password } = req.body || {};
-            if (!password) return res.status(400).json({ error: "password_required" });
+            if (!password) return res.status(400).json({ error: "password_required", step: "password" });
             const result = await authApi.verifyPassword(req.account, accountStore, password);
             res.json({ next: "done", me: result.me });
         } catch (err) { next(err); }
@@ -64,20 +77,36 @@ export function buildRouter() {
     // ── Профиль ───────────────────────────────────────────────────
     r.get("/accounts/:accountId/me", async (req, res, next) => {
         try {
-            const client = await getClient(req);
-            res.json(await prof.getMe(client));
+            res.json(await prof.getMe(await getClient(req)));
         } catch (err) { next(err); }
     });
 
+    // JSON — имя/фамилия/био; multipart с полем `avatar` — аватарка.
     r.post("/accounts/:accountId/me", async (req, res, next) => {
-        try {
-            const client = await getClient(req);
-            const result = await prof.updateProfile(client, req.body || {});
-            res.json(result);
-        } catch (err) { next(err); }
+        if (!isMultipart(req)) {
+            try {
+                const client = await getClient(req);
+                res.json(await prof.updateProfile(client, pickProfileFields(req.body || {})));
+            } catch (err) { next(err); }
+            return;
+        }
+        req.uploadAvatar(req, res, async (uploadErr) => {
+            if (uploadErr) return next(uploadErr);
+            try {
+                const client = await getClient(req);
+                if (req.file?.buffer) {
+                    await prof.setProfilePhoto(client, req.file.buffer);
+                }
+                const patch = pickProfileFields(req.body || {});
+                const result = Object.keys(patch).length
+                    ? await prof.updateProfile(client, patch)
+                    : await prof.getMe(client);
+                res.json(result);
+            } catch (err) { next(err); }
+        });
     });
 
-    // ── Диалоги и история ─────────────────────────────────────────
+    // ── Диалоги и чаты ────────────────────────────────────────────
     r.get("/accounts/:accountId/dialogs", async (req, res, next) => {
         try {
             const client = await getClient(req);
@@ -88,6 +117,13 @@ export function buildRouter() {
                 query,
             });
             res.json({ dialogs });
+        } catch (err) { next(err); }
+    });
+
+    r.get("/accounts/:accountId/chat/:peer", async (req, res, next) => {
+        try {
+            const client = await getClient(req);
+            res.json(await dlg.fetchChat(client, req.params.peer));
         } catch (err) { next(err); }
     });
 
@@ -115,9 +151,8 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
-    // multipart файлы
     r.post("/accounts/:accountId/chat/:peer/files", (req, res, next) => {
-        req.upload(req, res, async (uploadErr) => {
+        req.uploadFiles(req, res, async (uploadErr) => {
             if (uploadErr) return next(uploadErr);
             try {
                 const client = await getClient(req);
@@ -144,11 +179,14 @@ export function buildRouter() {
     r.delete("/accounts/:accountId/chat/:peer/messages", async (req, res, next) => {
         try {
             const client = await getClient(req);
-            const ids = (req.query.ids || "").split(",").map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n));
+            const ids = String(req.query.ids || "").split(",")
+                .map((s) => parseInt(s, 10))
+                .filter((n) => !Number.isNaN(n));
+            if (ids.length === 0) return res.status(400).json({ error: "ids_required" });
             await msg.deleteMessages(client, req.params.peer, ids, {
                 revoke: String(req.query.revoke ?? "true") !== "false",
             });
-            res.json({ ok: true });
+            res.json({ ok: true, deleted: ids });
         } catch (err) { next(err); }
     });
 
@@ -172,7 +210,8 @@ export function buildRouter() {
     r.post("/accounts/:accountId/chat/:peer/forward", async (req, res, next) => {
         try {
             const client = await getClient(req);
-            const ids = (req.body?.ids || []).map((s) => parseInt(s, 10));
+            const ids = (req.body?.ids || []).map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n));
+            if (ids.length === 0) return res.status(400).json({ error: "ids_required" });
             const sent = await msg.forwardMessages(client, req.params.peer, ids, {
                 fromPeer: req.body?.fromPeer,
             });
@@ -180,30 +219,57 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
-    // Скачивание медиа вложения
     r.get("/accounts/:accountId/chat/:peer/messages/:msgId/file", async (req, res, next) => {
         try {
             const client = await getClient(req);
-            const buffer = await msg.downloadMedia(client, req.params.peer,
+            const media = await msg.downloadMedia(client, req.params.peer,
                 parseInt(req.params.msgId, 10));
-            res.setHeader("Content-Type", "application/octet-stream");
-            res.send(buffer);
+            res.setHeader("Content-Type", media.mimeType || "application/octet-stream");
+            res.setHeader("Content-Length", media.buffer.length);
+            if (media.fileName) {
+                res.setHeader("Content-Disposition",
+                    `attachment; filename*=UTF-8''${encodeURIComponent(media.fileName)}`);
+            }
+            res.send(media.buffer);
         } catch (err) { next(err); }
     });
 
-    // ── Статус ─────────────────────────────────────────────────────
+    // ── Статус присутствия ─────────────────────────────────────────
     r.get("/accounts/:accountId/status", async (req, res, next) => {
         try {
-            const client = await getClient(req);
-            const me = await client.getMe();
-            res.json({ online: Boolean(me.status && /online/i.test(me.status.className)) });
+            const me = await prof.getMe(await getClient(req));
+            res.json({ online: /online/i.test(String(me.status)), status: me.status });
+        } catch (err) { next(err); }
+    });
+
+    r.post("/accounts/:accountId/status", async (req, res, next) => {
+        try {
+            const online = Boolean(req.body?.online);
+            await prof.setStatus(await getClient(req), online);
+            res.json({ ok: true, online });
         } catch (err) { next(err); }
     });
 
     return r;
 }
 
-// ── Хелперы (локальные в router.js) ─────────────────────────────
+// ── Хелперы ─────────────────────────────────────────────────────
+
+/** @param {import("express").Request} req */
 async function getClient(req) {
     return sessionManager.getClient(req.account);
+}
+
+/** @param {import("express").Request} req */
+function isMultipart(req) {
+    return String(req.headers["content-type"] || "").includes("multipart/form-data");
+}
+
+/** Оставляет только поля профиля, которые реально пришли. */
+function pickProfileFields(body) {
+    const patch = {};
+    for (const key of ["firstName", "lastName", "about"]) {
+        if (body[key] !== undefined) patch[key] = body[key];
+    }
+    return patch;
 }

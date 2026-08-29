@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { buildClient, apiCredentials } from "./client.js";
+import { ProtocolError } from "./errors.js";
 
 /**
  * Пул TelegramClient по аккаунтам. Авторизованные клиенты живут в `clients`
@@ -16,6 +17,22 @@ class SessionManager {
         this.channels = new Map();
         /** @type {Map<string, Promise<import("teleproto").TelegramClient>>} влетающие подключения */
         this.connecting = new Map();
+        /** @type {Array<(accountId: string, bus: EventEmitter) => void>} наблюдатели за созданием каналов */
+        this.channelObservers = [];
+    }
+
+    /**
+     * Подписка на появление нового канала аккаунта (нужна логу обновлений,
+     * который должен цепляться к каналам, созданным уже после старта).
+     * @param {(accountId: string, bus: EventEmitter) => void} observer
+     */
+    onChannelCreated(observer) {
+        this.channelObservers.push(observer);
+    }
+
+    /** @returns {{ apiId: number, apiHash: string }} */
+    apiCredentials() {
+        return apiCredentials();
     }
 
     /** @param {string} accountId */
@@ -24,6 +41,9 @@ class SessionManager {
             const bus = new EventEmitter();
             bus.setMaxListeners(0);
             this.channels.set(accountId, bus);
+            for (const observer of this.channelObservers) {
+                try { observer(accountId, bus); } catch { /* наблюдатель не должен ломать канал */ }
+            }
         }
         return this.channels.get(accountId);
     }
@@ -36,7 +56,9 @@ class SessionManager {
      */
     async getClient(account) {
         if (!account.sessionString) {
-            throw new Error("Аккаунт не авторизован в Telegram.");
+            throw new ProtocolError("not_authorized", "Аккаунт не авторизован в Telegram.", {
+                hint: "POST /v1/accounts/:id/auth/send-code",
+            });
         }
         const existing = this.clients.get(account.accountId);
         if (existing) return existing.client;
@@ -65,7 +87,11 @@ class SessionManager {
             await client.connect();
             const authorized = await client.isUserAuthorized();
             if (!authorized) {
-                throw new Error("Сессия недействительна или отозвана. Нужен повторный логин.");
+                throw new ProtocolError(
+                    "session_invalid",
+                    "Сессия недействительна или отозвана. Нужен повторный логин.",
+                    { hint: "POST /v1/accounts/:id/auth/send-code" }
+                );
             }
             const { startAccountListener } = await import("./listener.js");
             const stopListener = startAccountListener(client, this.channel(account.accountId));
@@ -105,9 +131,9 @@ class SessionManager {
     clearPending(accountId) {
         const entry = this.pendingAuth.get(accountId);
         if (entry) {
-            entry.client.disconnect().catch(() => {});
-            entry.client.destroy?.().catch(() => {});
             this.pendingAuth.delete(accountId);
+            Promise.resolve(entry.client.disconnect?.()).catch(() => {});
+            Promise.resolve(entry.client.destroy?.()).catch(() => {});
         }
     }
 
@@ -141,26 +167,55 @@ class SessionManager {
     }
 
     /**
-     * Отключает и удаляет клиент аккаунта (при логауте/удалении).
+     * Логаут: отзывает сессию в Telegram, отключает и убирает клиент из пула.
+     * Канал событий НЕ удаляется — вместо этого в него уходит терминальное
+     * событие, чтобы подписанные WS-клиенты корректно закрылись. Иначе после
+     * повторного логина создался бы новый EventEmitter, а старые сокеты
+     * навсегда остались бы на «мёртвом».
      * @param {string} accountId
      */
     async release(accountId) {
+        await this.#teardown(accountId, { logOut: true });
+        this.channel(accountId).emit("account_event", {
+            accountEvent: true,
+            type: "session_closed",
+            reason: "logout",
+        });
+    }
+
+    /**
+     * Отключает клиент аккаунта, НЕ отзывая сессию в Telegram (остановка сервиса).
+     * @param {string} accountId
+     */
+    async detach(accountId) {
+        await this.#teardown(accountId, { logOut: false });
+    }
+
+    /**
+     * Отключает все клиенты без логаута — для graceful shutdown.
+     * @returns {Promise<void>}
+     */
+    async disconnectAll() {
+        const ids = [...this.clients.keys(), ...this.pendingAuth.keys()];
+        await Promise.all([...new Set(ids)].map((id) => this.detach(id)));
+    }
+
+    /**
+     * @param {string} accountId
+     * @param {{ logOut: boolean }} opts
+     */
+    async #teardown(accountId, { logOut }) {
         this.clearPending(accountId);
         const entry = this.clients.get(accountId);
-        if (entry) {
-            entry.stopListener?.();
-            await entry.client.logOut?.().catch(() => {});
-            await entry.client.disconnect().catch(() => {});
-            await entry.client.destroy?.().catch(() => {});
-            this.clients.delete(accountId);
+        if (!entry) return;
+        this.clients.delete(accountId);
+        entry.stopListener?.();
+        if (logOut) {
+            await Promise.resolve(entry.client.logOut?.()).catch(() => {});
         }
-        const bus = this.channels.get(accountId);
-        if (bus) {
-            bus.removeAllListeners();
-            this.channels.delete(accountId);
-        }
+        await Promise.resolve(entry.client.disconnect?.()).catch(() => {});
+        await Promise.resolve(entry.client.destroy?.()).catch(() => {});
     }
 }
 
 export const sessionManager = new SessionManager();
-export { apiCredentials };

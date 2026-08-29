@@ -1,4 +1,5 @@
-import { toMarkedId } from "./entities.js";
+import { resolveEntity, toMarkedId } from "./entities.js";
+import { idToString } from "./serialize.js";
 
 /**
  * Нормализует диалог.
@@ -28,6 +29,32 @@ export function normalizeDialog(dialog) {
             out: Boolean(message.out),
             mediaType: message.media?.className || null,
         } : null,
+    };
+}
+
+/**
+ * Информация о чате/пользователе по его идентификатору.
+ * @param {import("teleproto").TelegramClient} client
+ * @param {string} rawPeer
+ * @returns {Promise<object>}
+ */
+export async function fetchChat(client, rawPeer) {
+    const entity = await resolveEntity(client, rawPeer);
+    return {
+        id: toMarkedId(entity),
+        rawId: idToString(entity.id),
+        type: detectType({}, entity),
+        className: entity.className || null,
+        title: entity.title ||
+            [entity.firstName, entity.lastName].filter(Boolean).join(" ") ||
+            (entity.username ? `@${entity.username}` : ""),
+        username: entity.username || null,
+        phone: entity.phone || null,
+        bot: Boolean(entity.bot),
+        verified: Boolean(entity.verified),
+        scam: Boolean(entity.scam),
+        participantsCount: entity.participantsCount ?? null,
+        status: entity.status?.className || null,
     };
 }
 

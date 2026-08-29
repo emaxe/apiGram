@@ -1,8 +1,13 @@
 import { Api, errors } from "teleproto";
+import { CustomFile } from "teleproto/client/uploads.js";
 import { resolveEntity, toMarkedId } from "./entities.js";
 import { idToString } from "./serialize.js";
+import { ProtocolError } from "./errors.js";
 
 const { FloodWaitError } = errors;
+
+/** Максимальное ожидание FloodWait внутри запроса, сек. Дольше — отдаём 429 наверх. */
+const FLOOD_WAIT_MAX_SECONDS = 30;
 
 /**
  * Нормализует сообщение MTProto в компактный объект.
@@ -74,14 +79,14 @@ export async function fetchHistory(client, rawPeer, { limit = 40, offsetId = 0, 
     try {
         await load();
     } catch (err) {
-        if (err instanceof FloodWaitError || typeof err?.seconds === "number") {
-            const wait = (err.seconds || 5) + 1;
-            await new Promise((r) => setTimeout(r, wait * 1000));
-            messages.length = 0;
-            await load();
-        } else {
-            throw err;
-        }
+        const isFlood = err instanceof FloodWaitError || typeof err?.seconds === "number";
+        // Долгий FloodWait не отсиживаем внутри HTTP-запроса — пробрасываем,
+        // сервер отдаст 429 с `seconds`, и клиент повторит сам.
+        if (!isFlood || (err.seconds || 0) > FLOOD_WAIT_MAX_SECONDS) throw err;
+        const wait = (err.seconds || 5) + 1;
+        await new Promise((r) => setTimeout(r, wait * 1000));
+        messages.length = 0;
+        await load();
     }
     return messages;
 }
@@ -118,19 +123,42 @@ export async function deleteMessages(client, rawPeer, ids, { revoke = true } = {
 export const ALBUM_LIMIT = 10;
 
 /**
+ * Приводит вход к тому, что понимает `client.sendFile`: путь, Buffer или
+ * `{ name, buffer }` из multipart. Простой объект `{name, buffer}` teleproto
+ * не принимает — его нужно завернуть в `CustomFile`, иначе получаем
+ * `Cannot use [object Object] as file`.
+ * @param {string|Buffer|{name?: string, buffer: Buffer}} file
+ * @returns {string|Buffer|import("teleproto/client/uploads.js").CustomFile}
+ */
+function toUploadable(file) {
+    if (typeof file === "string" || Buffer.isBuffer(file)) return file;
+    if (file && Buffer.isBuffer(file.buffer)) {
+        return new CustomFile(file.name || "file", file.buffer.length, "", file.buffer);
+    }
+    throw new ProtocolError("file_invalid", "Не удалось прочитать файл для отправки.");
+}
+
+/**
  * Отправка одного файла или альбома.
  * @param {import("teleproto").TelegramClient} client
  * @param {string} rawPeer
- * @param {string|Buffer|Array<string|Buffer>} files
+ * @param {string|Buffer|{name?: string, buffer: Buffer}|Array<string|Buffer|{name?: string, buffer: Buffer}>} files
  * @param {object} [opts] { caption, replyTo, forceDocument }
  * @returns {Promise<Array<object>>}
  */
 export async function sendFiles(client, rawPeer, files, { caption = "", replyTo, forceDocument = false } = {}) {
-    const list = Array.isArray(files) ? files : [files];
-    if (list.length === 0) throw new Error("Не указан ни один файл");
-    if (list.length > ALBUM_LIMIT) throw new Error(`За раз не больше ${ALBUM_LIMIT} файлов`);
+    const list = (Array.isArray(files) ? files : [files]).filter(Boolean);
+    if (list.length === 0) throw new ProtocolError("no_files", "Не указан ни один файл.");
+    if (list.length > ALBUM_LIMIT) {
+        throw new ProtocolError("too_many_files", `За раз не больше ${ALBUM_LIMIT} файлов.`);
+    }
+    const uploadable = list.map(toUploadable);
     const entity = await resolveEntity(client, rawPeer);
-    const params = { file: list.length === 1 ? list[0] : list, caption, forceDocument };
+    const params = {
+        file: uploadable.length === 1 ? uploadable[0] : uploadable,
+        caption,
+        forceDocument,
+    };
     if (replyTo) params.replyTo = replyTo;
     const sent = await client.sendFile(entity, params);
     return (Array.isArray(sent) ? sent : [sent]).filter(Boolean).map(normalizeMessage);
@@ -147,9 +175,26 @@ export async function sendFiles(client, rawPeer, files, { caption = "", replyTo,
 export async function downloadMedia(client, rawPeer, messageId) {
     const entity = await resolveEntity(client, rawPeer);
     const [raw] = await client.getMessages(entity, { ids: [messageId] });
-    if (!raw?.media) throw new Error("У сообщения нет медиа");
+    if (!raw) throw new ProtocolError("message_not_found", "Сообщение не найдено.");
+    if (!raw.media) throw new ProtocolError("no_media", "У сообщения нет медиа.");
     const buffer = await client.downloadMedia(raw.media);
-    return Buffer.from(buffer || []);
+    return {
+        buffer: Buffer.from(buffer || []),
+        fileName: mediaFileName(raw.media),
+        mimeType: raw.media.document?.mimeType || null,
+    };
+}
+
+/**
+ * Достаёт имя файла из атрибутов документа, если оно есть.
+ * @param {object} media
+ * @returns {string|null}
+ */
+function mediaFileName(media) {
+    const attributes = media?.document?.attributes;
+    if (!Array.isArray(attributes)) return null;
+    const named = attributes.find((a) => a.className === "DocumentAttributeFilename");
+    return named?.fileName || null;
 }
 
 /**

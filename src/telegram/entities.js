@@ -1,5 +1,6 @@
 import { getPeerId } from "teleproto/Utils.js";
 import { idToString } from "./serialize.js";
+import { ProtocolError } from "./errors.js";
 
 /**
  * Приводит пир к "маркированному" строковому ID, как его отдаёт teleproto для
@@ -25,7 +26,7 @@ export function toMarkedId(peer) {
  */
 export function parsePeer(raw) {
     const value = String(raw || "").trim();
-    if (!value) throw new Error("Не указан идентификатор чата (peer)");
+    if (!value) throw new ProtocolError("peer_required", "Не указан идентификатор чата (peer).");
     if (value === "me" || value === "self") return "me";
     if (/^-?\d+$/.test(value)) {
         return BigInt(value);
@@ -44,12 +45,19 @@ export async function resolveEntity(client, rawPeer) {
     try {
         return await client.getEntity(peer);
     } catch (err) {
-        const msg = err?.message || String(err);
-        if (/CHANNEL_PRIVATE/i.test(msg)) {
-            throw new Error(`Нет доступа к ${rawPeer}: канал приватный или аккаунт в нём не состоит.`);
+        const msg = String(err?.errorMessage || err?.message || err);
+        if (/CHANNEL_PRIVATE|CHAT_ADMIN_REQUIRED|USER_BANNED_IN_CHANNEL/i.test(msg)) {
+            throw new ProtocolError(
+                "peer_forbidden",
+                `Нет доступа к ${rawPeer}: чат приватный или аккаунт в нём не состоит.`,
+                { cause: err }
+            );
         }
-        if (/USERNAME_NOT_OCCUPIED|USERNAME_INVALID|Cannot find any entity/i.test(msg)) {
-            throw new Error(`Чат ${rawPeer} не найден.`);
+        if (/USERNAME_NOT_OCCUPIED|USERNAME_INVALID|PEER_ID_INVALID|Cannot find any entity|Could not find the input entity/i.test(msg)) {
+            throw new ProtocolError("peer_not_found", `Чат ${rawPeer} не найден.`, {
+                hint: "Для чатов по числовому ID сначала загрузите список диалогов: GET /v1/accounts/:id/dialogs",
+                cause: err,
+            });
         }
         throw err;
     }

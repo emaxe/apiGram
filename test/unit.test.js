@@ -15,8 +15,11 @@ import {
 } from "../src/registry/accountsFile.js";
 import { sessionManager } from "../src/telegram/sessionManager.js";
 import { authStatus } from "../src/telegram/auth.js";
-import { normalizeMessage } from "../src/telegram/messages.js";
+import { normalizeMessage, sendFiles } from "../src/telegram/messages.js";
 import { normalizeDialog } from "../src/telegram/dialogs.js";
+import { toPlain } from "../src/telegram/serialize.js";
+import { ProtocolError } from "../src/telegram/errors.js";
+import { toHttpError } from "../src/server/httpErrors.js";
 
 test("json: writeJson/readJson round-trip с 0600", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "apigram-"));
@@ -52,7 +55,7 @@ test("registry: create/find/update/delete", () => {
     assert.equal(deleteAccount(account.accountId), false);
 });
 
-test("sessionManager: channel создаётся единожды и чистится release", () => {
+test("sessionManager: channel переиспользуется и переживает release", async () => {
     const c1 = sessionManager.channel("acc_x");
     const c2 = sessionManager.channel("acc_x");
     assert.equal(c1, c2);
@@ -60,8 +63,27 @@ test("sessionManager: channel создаётся единожды и чисти�
     c1.on("ping", () => got++);
     c1.emit("ping");
     assert.equal(got, 1);
-    sessionManager.release("acc_x");
-    assert.equal(sessionManager.channels.has("acc_x"), false);
+
+    // release шлёт терминальное событие, но НЕ выбрасывает канал: иначе
+    // подписанные WS-сокеты остались бы на emitter'е, который после повторного
+    // логина никто уже не использует.
+    const closed = [];
+    c1.on("account_event", (e) => closed.push(e));
+    await sessionManager.release("acc_x");
+    assert.equal(sessionManager.channels.get("acc_x"), c1);
+    assert.equal(closed.length, 1);
+    assert.equal(closed[0].type, "session_closed");
+    sessionManager.channels.delete("acc_x");
+});
+
+test("sessionManager: onChannelCreated срабатывает только на новый канал", () => {
+    const seen = [];
+    sessionManager.onChannelCreated((id) => seen.push(id));
+    sessionManager.channel("acc_obs");
+    sessionManager.channel("acc_obs");
+    assert.deepEqual(seen, ["acc_obs"]);
+    sessionManager.channelObservers.length = 0;
+    sessionManager.channels.delete("acc_obs");
 });
 
 test("auth: authStatus по состояниям", () => {
@@ -129,4 +151,80 @@ test("dialogs: normalizeDialog отдаёт компактный объект", 
     assert.equal(d.title, "Канал");
     assert.equal(d.pinned, true);
     assert.equal(d.lastMessage.text, "yep");
+});
+
+test("httpErrors: коды ProtocolError → HTTP-статусы, а не тотальный 500", () => {
+    const notFound = toHttpError(new ProtocolError("peer_not_found", "Чат не найден."));
+    assert.equal(notFound.status, 404);
+    assert.equal(notFound.body.error, "peer_not_found");
+
+    const badCode = toHttpError(new ProtocolError("phone_code_invalid", "Неверный код.", {
+        step: "verify-code",
+    }));
+    assert.equal(badCode.status, 400);
+    assert.equal(badCode.body.step, "verify-code");
+
+    const notAuth = toHttpError(new ProtocolError("not_authorized", "Не авторизован.", {
+        hint: "send-code",
+    }));
+    assert.equal(notAuth.status, 409);
+    assert.equal(notAuth.body.hint, "send-code");
+
+    const flood = toHttpError(Object.assign(new Error("FLOOD_WAIT_42"), { seconds: 42 }));
+    assert.equal(flood.status, 429);
+    assert.equal(flood.body.seconds, 42);
+
+    const raw = toHttpError(Object.assign(new Error("boom"), { errorMessage: "CHAT_WRITE_FORBIDDEN" }));
+    assert.equal(raw.status, 403);
+
+    assert.equal(toHttpError(new Error("что-то пошло не так")).status, 500);
+});
+
+test("serialize: toPlain обезвреживает BigInt, Buffer, Date и методы", () => {
+    const plain = toPlain({
+        className: "Message",
+        id: 5,
+        big: 123456789012345678901234567890n,
+        buf: Buffer.from("hi"),
+        when: new Date("2024-01-02T03:04:05.000Z"),
+        reply: () => {},
+        _private: "скрыто",
+        nested: { arr: [1n, "x"] },
+    });
+    assert.equal(plain.className, "Message");
+    assert.equal(plain.big, "123456789012345678901234567890");
+    assert.equal(plain.buf.base64, Buffer.from("hi").toString("base64"));
+    assert.equal(plain.when, "2024-01-02T03:04:05.000Z");
+    assert.equal("reply" in plain, false);
+    assert.equal("_private" in plain, false);
+    assert.deepEqual(plain.nested.arr, ["1", "x"]);
+    assert.doesNotThrow(() => JSON.stringify(plain));
+});
+
+test("messages: sendFiles заворачивает {name, buffer} в CustomFile", async () => {
+    const { CustomFile } = await import("teleproto/client/uploads.js");
+    let passed;
+    const client = {
+        getEntity: async () => ({ className: "User", id: 1 }),
+        sendFile: async (entity, params) => { passed = params; return [{ id: 1, message: "" }]; },
+    };
+    await sendFiles(client, "me", [{ name: "a.txt", buffer: Buffer.from("hi") }]);
+    // Простой объект teleproto не принимает — раньше сюда уходил {name, buffer}
+    // и sendFile падал с "Cannot use [object Object] as file".
+    assert.ok(passed.file instanceof CustomFile);
+    assert.equal(passed.file.name, "a.txt");
+    assert.equal(passed.file.size, 2);
+
+    await sendFiles(client, "me", [
+        { name: "a.txt", buffer: Buffer.from("a") },
+        { name: "b.txt", buffer: Buffer.from("bb") },
+    ]);
+    assert.ok(Array.isArray(passed.file));
+    assert.ok(passed.file.every((f) => f instanceof CustomFile));
+
+    await assert.rejects(() => sendFiles(client, "me", []), /Не указан ни один файл/);
+    await assert.rejects(
+        () => sendFiles(client, "me", new Array(11).fill({ name: "x", buffer: Buffer.from("x") })),
+        /не больше 10 файлов/
+    );
 });

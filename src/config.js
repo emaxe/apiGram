@@ -24,6 +24,8 @@ export const config = {
     apiHash: process.env.TELEGRAM_API_HASH || "",
     host: process.env.HOST || "127.0.0.1",
     port: parseInt(process.env.PORT || "3111", 10),
+    adminToken: process.env.ADMIN_TOKEN || "",
+    logUpdates: String(process.env.LOG_UPDATES || "false") === "true",
 
     assertCredentials() {
         if (!config.apiId || !config.apiHash) {

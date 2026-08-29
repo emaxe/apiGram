@@ -12,34 +12,63 @@ export const accountStore = {
         updateAccount(accountId, patch);
     },
     clearSession(accountId) {
-        updateAccount(accountId, { sessionString: "", status: "no_session", me: null,
-            auth: { phoneCodeHash: null } });
+        updateAccount(accountId, {
+            sessionString: "",
+            status: "no_session",
+            me: null,
+            auth: { phoneCodeHash: null },
+        });
     },
 };
 
+/**
+ * Аккаунты, принадлежащие токену. В MVP один токен = один аккаунт.
+ * @param {string} token
+ * @returns {Array<object>} публичные представления
+ */
 export function listAccounts(token) {
-    // Возвращает аккаунты, принадлежащие токену; в MVP один токен = один аккаунт.
-    const acc = findAccountByToken(token);
-    return acc ? [toPublic(acc)] : [];
+    const account = findAccountByToken(token);
+    return account ? [toPublic(account)] : [];
 }
 
+/**
+ * Аккаунт по ID при условии, что токен принадлежит именно ему.
+ * @param {string} accountId
+ * @param {string} token
+ * @returns {object|null} сырой аккаунт (с sessionString) или null
+ */
 export function getAccount(accountId, token) {
-    const acc = findAccount(accountId);
-    if (!acc || acc.apiToken !== token) return null;
-    return acc;
+    if (!accountId || !token) return null;
+    const account = findAccount(accountId);
+    if (!account || account.apiToken !== token) return null;
+    return account;
 }
 
+/**
+ * Создаёт аккаунт и выдаёт токен.
+ * @param {string} name
+ * @returns {object}
+ */
 export function makeAccount(name) {
     return createAccount(name);
 }
 
+/**
+ * Удаляет аккаунт, если токен ему принадлежит.
+ * @param {string} accountId
+ * @param {string} token
+ * @returns {boolean}
+ */
 export function removeAccount(accountId, token) {
-    const acc = getAccount(accountId, token);
-    if (!acc) return false;
+    if (!getAccount(accountId, token)) return false;
     return delAccount(accountId);
 }
 
-/** Публичное представление без секрета sessionString. */
+/**
+ * Публичное представление без секретов (sessionString, apiToken).
+ * @param {object} acc
+ * @returns {object}
+ */
 export function toPublic(acc) {
     return {
         accountId: acc.accountId,
