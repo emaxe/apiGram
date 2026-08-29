@@ -13,6 +13,7 @@ import {
     updateAccount,
     deleteAccount,
 } from "../src/registry/accountsFile.js";
+import { sessionManager } from "../src/telegram/sessionManager.js";
 
 test("json: writeJson/readJson round-trip с 0600", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "apigram-"));
@@ -46,4 +47,16 @@ test("registry: create/find/update/delete", () => {
     assert.equal(deleteAccount(account.accountId), true);
     assert.equal(findAccount(account.accountId), undefined);
     assert.equal(deleteAccount(account.accountId), false);
+});
+
+test("sessionManager: channel создаётся единожды и чистится release", () => {
+    const c1 = sessionManager.channel("acc_x");
+    const c2 = sessionManager.channel("acc_x");
+    assert.equal(c1, c2);
+    let got = 0;
+    c1.on("ping", () => got++);
+    c1.emit("ping");
+    assert.equal(got, 1);
+    sessionManager.release("acc_x");
+    assert.equal(sessionManager.channels.has("acc_x"), false);
 });
