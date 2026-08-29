@@ -101,6 +101,22 @@ test("messages: normalizeMessage сворачивает даты и peerId", () 
     assert.equal(normalizeMessage(null), null);
 });
 
+test("messages: normalizeMessage сворачивает entities в JSON-safe", () => {
+    const msg = normalizeMessage({
+        id: 13,
+        message: "@user hi",
+        peerId: { value: 1 },
+        entities: [
+            { className: "MessageEntityMentionName", offset: 0, length: 5, userId: 123456789n },
+            { className: "MessageEntityTextUrl", offset: 7, length: 2, url: "https://x.test" },
+        ],
+    });
+    assert.ok(Array.isArray(msg.entities));
+    assert.equal(msg.entities.length, 2);
+    assert.equal(msg.entities[0].userId, "123456789");
+    assert.doesNotThrow(() => JSON.stringify(msg));
+});
+
 test("dialogs: normalizeDialog отдаёт компактный объект", () => {
     const d = normalizeDialog({
         id: { value: -100789 },

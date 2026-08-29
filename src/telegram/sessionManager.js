@@ -128,6 +128,8 @@ class SessionManager {
      */
     async registerAuthorized(account, client) {
         const { startAccountListener } = await import("./listener.js");
+        const previous = this.clients.get(account.accountId);
+        previous?.stopListener?.();
         const stopListener = startAccountListener(client, this.channel(account.accountId));
         this.clients.set(account.accountId, { client, stopListener });
         const pending = this.pendingAuth.get(account.accountId);

@@ -24,7 +24,7 @@ export function normalizeMessage(message) {
         views: message.views || null,
         forwards: message.forwards || null,
         mediaType: message.media?.className || null,
-        entities: message.entities || [],
+        entities: normalizeEntities(message.entities),
         reactions: Array.isArray(message.reactions?.results)
             ? message.reactions.results.map((r) => ({
                   emoticon: r.reaction?.emoticon || "👍",
@@ -33,6 +33,27 @@ export function normalizeMessage(message) {
               }))
             : [],
     };
+}
+
+/**
+ * Приводит entities сообщения к JSON-safe виду. Сырые TL-объекты могут
+ * содержать bigint (например, userId в MessageEntityMentionName), что ломает
+ * JSON.stringify — поэтому каждый entity сворачивается в плоский объект.
+ * @param {object[]} [entities]
+ * @returns {object[]}
+ */
+function normalizeEntities(entities) {
+    if (!Array.isArray(entities)) return [];
+    return entities.map((e) => {
+        const out = {
+            type: e.className || "unknown",
+            offset: e.offset,
+            length: e.length,
+        };
+        if (e.url !== undefined) out.url = e.url;
+        if (e.userId !== undefined) out.userId = idToString(e.userId);
+        return out;
+    });
 }
 
 /**

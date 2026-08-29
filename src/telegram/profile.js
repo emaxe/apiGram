@@ -1,3 +1,4 @@
+import { CustomFile } from "teleproto/client/uploads.js";
 import { Api } from "teleproto";
 import { idToString } from "./serialize.js";
 
@@ -42,7 +43,7 @@ export async function updateProfile(client, { firstName, lastName, about } = {})
  */
 export async function setProfilePhoto(client, buffer) {
     const uploaded = await client.uploadFile({
-        file: new Uint8Array(buffer),
+        file: new CustomFile("avatar", buffer.length, "", buffer),
     });
     await client.invoke(new Api.photos.UploadProfilePhoto({ file: uploaded }));
     return getMe(client);
