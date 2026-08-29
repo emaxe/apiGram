@@ -151,7 +151,7 @@ export async function sendReaction(client, rawPeer, messageId, emoji = "👍") {
 export async function markAsRead(client, rawPeer, maxId = 0) {
     const entity = await resolveEntity(client, rawPeer);
     try {
-        if (maxId > 0) await client.sendReadAcknowledge(entity, { maxId });
+        if (maxId > 0) await client.markAsRead(entity, maxId, {});
         else await client.markAsRead(entity);
     } catch {
         // игнорируем незначительные ошибки прочтения
