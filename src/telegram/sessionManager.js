@@ -14,6 +14,8 @@ class SessionManager {
         this.pendingAuth = new Map();
         /** @type {Map<string, EventEmitter>} канал событий на аккаунт */
         this.channels = new Map();
+        /** @type {Map<string, Promise<import("teleproto").TelegramClient>>} влетающие подключения */
+        this.connecting = new Map();
     }
 
     /** @param {string} accountId */
@@ -39,18 +41,41 @@ class SessionManager {
         const existing = this.clients.get(account.accountId);
         if (existing) return existing.client;
 
-        const client = buildClient(account.sessionString);
-        await client.connect();
-        const authorized = await client.isUserAuthorized();
-        if (!authorized) {
-            await client.disconnect().catch(() => {});
-            this.clients.delete(account.accountId);
-            throw new Error("Сессия недействительна или отозвана. Нужен повторный логин.");
+        if (this.connecting.has(account.accountId)) {
+            return this.connecting.get(account.accountId);
         }
-        const { startAccountListener } = await import("./listener.js");
-        const stopListener = startAccountListener(client, this.channel(account.accountId));
-        this.clients.set(account.accountId, { client, stopListener });
-        return client;
+
+        const promise = this.#connectClient(account);
+        this.connecting.set(account.accountId, promise);
+        try {
+            return await promise;
+        } finally {
+            this.connecting.delete(account.accountId);
+        }
+    }
+
+    /**
+     * Подключает и проверяет клиент аккаунта, ставя его в пул `clients`.
+     * @param {object} account
+     * @returns {Promise<import("teleproto").TelegramClient>}
+     */
+    async #connectClient(account) {
+        const client = buildClient(account.sessionString);
+        try {
+            await client.connect();
+            const authorized = await client.isUserAuthorized();
+            if (!authorized) {
+                throw new Error("Сессия недействительна или отозвана. Нужен повторный логин.");
+            }
+            const { startAccountListener } = await import("./listener.js");
+            const stopListener = startAccountListener(client, this.channel(account.accountId));
+            this.clients.set(account.accountId, { client, stopListener });
+            return client;
+        } catch (err) {
+            await client.disconnect().catch(() => {});
+            await client.destroy?.().catch(() => {});
+            throw err;
+        }
     }
 
     /**
@@ -87,7 +112,17 @@ class SessionManager {
     }
 
     /**
+     * Убирает незавершённый логин без уничтожения его клиента (тот перешёл в пул).
+     * @param {string} accountId
+     */
+    #adoptPending(accountId) {
+        this.pendingAuth.delete(accountId);
+    }
+
+    /**
      * Регистрирует авторизованный клиент после успешного логина.
+     * Никогда не уничтожает переданный клиент — если в `pendingAuth` лежит
+     * тот же клиент, он просто «усыновляется» в пул.
      * @param {object} account
      * @param {import("teleproto").TelegramClient} client
      */
@@ -95,7 +130,12 @@ class SessionManager {
         const { startAccountListener } = await import("./listener.js");
         const stopListener = startAccountListener(client, this.channel(account.accountId));
         this.clients.set(account.accountId, { client, stopListener });
-        this.clearPending(account.accountId);
+        const pending = this.pendingAuth.get(account.accountId);
+        if (pending && pending.client === client) {
+            this.#adoptPending(account.accountId);
+        } else {
+            this.clearPending(account.accountId);
+        }
     }
 
     /**
