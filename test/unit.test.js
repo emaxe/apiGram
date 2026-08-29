@@ -15,6 +15,8 @@ import {
 } from "../src/registry/accountsFile.js";
 import { sessionManager } from "../src/telegram/sessionManager.js";
 import { authStatus } from "../src/telegram/auth.js";
+import { normalizeMessage } from "../src/telegram/messages.js";
+import { normalizeDialog } from "../src/telegram/dialogs.js";
 
 test("json: writeJson/readJson round-trip с 0600", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "apigram-"));
@@ -79,4 +81,36 @@ test("auth: authStatus по состояниям", () => {
         status: "no_session",
         next: "phone",
     });
+});
+
+test("messages: normalizeMessage сворачивает даты и peerId", () => {
+    const msg = normalizeMessage({
+        id: 12,
+        date: 1700000000,
+        out: true,
+        message: "hi",
+        peerId: { value: 123 },
+        fromId: { userId: 7 },
+    });
+    assert.equal(msg.id, 12);
+    assert.equal(msg.text, "hi");
+    assert.equal(msg.out, true);
+    assert.equal(msg.peerId, "123");
+    assert.equal(msg.fromId, "7");
+    assert.ok(msg.date > 0);
+    assert.equal(normalizeMessage(null), null);
+});
+
+test("dialogs: normalizeDialog отдаёт компактный объект", () => {
+    const d = normalizeDialog({
+        id: { value: -100789 },
+        entity: { className: "Channel", broadcast: true, title: "Канал" },
+        message: { id: 1, date: 1700000000, message: "yep" },
+        pinned: true,
+    });
+    assert.equal(d.id, "-100789");
+    assert.equal(d.type, "channel");
+    assert.equal(d.title, "Канал");
+    assert.equal(d.pinned, true);
+    assert.equal(d.lastMessage.text, "yep");
 });
