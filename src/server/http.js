@@ -36,8 +36,10 @@ export function createHttpApp() {
 
     app.use("/v1", buildRouter());
     app.use((err, req, res, next) => {
-        const status = err?.status || 500;
-        res.status(status).json({ error: String(err?.message || err) });
+        if (typeof err?.seconds === "number" || /flood/i.test(String(err?.message))) {
+            return res.status(429).json({ error: "flood_wait", seconds: err.seconds || 0 });
+        }
+        res.status(err?.status || 500).json({ error: String(err?.message || err) });
     });
     return app;
 }
