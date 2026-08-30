@@ -1,5 +1,17 @@
+/**
+ * Сериализация TL-объектов в чистый JSON.
+ *
+ * Всё, что уходит в HTTP-ответ или в сокет, обязано пройти через toPlain:
+ * ответы teleproto содержат BigInteger, Buffer и ссылки на живой клиент,
+ * на которых JSON.stringify либо падает, либо уходит в бесконечную рекурсию.
+ */
+
+// TL-структуры местами рекурсивны (сообщение → чат → последнее сообщение → …).
+// Глубины 8 хватает на любой осмысленный ответ, а цикл она обрывает гарантированно.
 const MAX_DEPTH = 8;
 
+// BigInteger из big-integer не является instanceof чего-то стабильного между
+// версиями teleproto, поэтому опознаём по утиной типизации, а не по классу.
 function isBigIntegerLike(value) {
     return (
         value !== null &&
@@ -42,7 +54,10 @@ export function toPlain(value, depth = 0) {
         const out = {};
         if (value.className) out.className = value.className;
         for (const key of Object.keys(value)) {
+            // Приватные поля библиотеки наружу не нужны.
             if (key.startsWith("_") && key !== "_type") continue;
+            // client и originalUpdate тянут за собой весь объект соединения —
+            // вместе с сессией, то есть с учётными данными аккаунта.
             if (key === "client" || key === "originalUpdate") continue;
             const plain = toPlain(value[key], depth + 1);
             if (plain !== undefined) out[key] = plain;

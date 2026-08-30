@@ -1,109 +1,149 @@
 # apiGram
 
-Multi-user Telegram API gateway (MTProto) — REST + WebSocket. Один процесс держит пул
-`TelegramClient` по одному на аккаунт; любое клиентское приложение подключается по HTTP
-и получает realtime-поток по WebSocket.
+[![npm version](https://img.shields.io/npm/v/apigram.svg)](https://www.npmjs.com/package/apigram)
+[![node](https://img.shields.io/node/v/apigram.svg)](https://nodejs.org)
+[![license](https://img.shields.io/npm/l/apigram.svg)](./LICENSE)
 
-## Установка и запуск
+Multi-user Telegram API gateway (MTProto) — REST + WebSocket.
+
+A single process keeps a pool of `TelegramClient` instances, one per account. Any client
+application talks to it over plain HTTP and receives a realtime stream over WebSocket.
+
+**Русская версия: [README.ru.md](./README.ru.md)**
+
+---
+
+## Table of contents
+
+- [Install](#install)
+- [The `run.sh` helper](#the-runsh-helper)
+- [Environment variables](#environment-variables)
+- [Quick start](#quick-start)
+- [Endpoints](#endpoints)
+- [WebSocket](#websocket)
+- [Errors](#errors)
+- [Security](#security)
+- [Limitations](#limitations)
+- [Tests](#tests)
+- [Changelog](#changelog)
+
+## Install
 
 ```bash
+npm install apigram
+```
+
+Or clone and run from source:
+
+```bash
+git clone https://github.com/emaxe/apiGram.git
+cd apiGram
 npm install
-cp .env.example .env      # задайте TELEGRAM_API_ID / TELEGRAM_API_HASH
+cp .env.example .env      # set TELEGRAM_API_ID / TELEGRAM_API_HASH
 npm start
 ```
 
-Ключи API — на https://my.telegram.org → API development tools.
+API credentials come from https://my.telegram.org → API development tools.
 
-### Скрипт `run.sh`
-
-То же самое и остальные режимы — через интерактивный помощник в корне проекта:
+Installed as a package, the gateway is also available as a binary:
 
 ```bash
-./run.sh              # меню
-./run.sh <команда>    # прямой вызов, напр. ./run.sh dev
+npx apigram
 ```
 
-| Команда | Действие |
+Requires Node.js >= 18.
+
+### The `run.sh` helper
+
+The repository ships an interactive helper that covers every mode:
+
+```bash
+./run.sh              # menu
+./run.sh <command>    # direct call, e.g. ./run.sh dev
+```
+
+| Command | Action |
 |---|---|
-| `install` | `npm ci` (по lock-файлу) или `npm install` |
-| `start` | запуск сервера с проверкой `.env`, зависимостей и занятости порта |
-| `dev` | запуск с автоперезапуском (`node --watch src/index.js`) |
-| `test` | юнит-тесты |
-| `smoke` | сквозная проверка на живом аккаунте (`scripts/smoke.mjs`) |
-| `env` | показать конфигурацию с маскированием секретов, создать `.env` из примера |
-| `health` | `GET /v1/health` по адресу из `.env` |
-| `doctor` | диагностика: версия Node, зависимости, ключи, каталог данных, порт |
-| `clean` | удаление `node_modules` или лога обновлений |
+| `install` | `npm ci` (from the lock file) or `npm install` |
+| `start` | start the server, checking `.env`, dependencies and port availability |
+| `dev` | start with auto-reload (`node --watch src/index.js`) |
+| `test` | unit tests |
+| `smoke` | end-to-end check against a live account (`scripts/smoke.mjs`) |
+| `env` | print the configuration with secrets masked, create `.env` from the example |
+| `health` | `GET /v1/health` against the address from `.env` |
+| `doctor` | diagnostics: Node version, dependencies, credentials, data directory, port |
+| `clean` | remove `node_modules` or the updates log |
 
-Адрес для `start`/`health`/`smoke` берётся из `.env`, а не задан жёстко. `clean` не трогает
-`data/accounts.json` — там сессии Telegram.
+The address used by `start` / `health` / `smoke` is read from `.env` rather than hard-coded.
+`clean` never touches `data/accounts.json` — that file holds the Telegram sessions.
 
-### Переменные окружения
+## Environment variables
 
-| Переменная | По умолчанию | Назначение |
+| Variable | Default | Purpose |
 |---|---|---|
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | — | обязательны |
-| `HOST` / `PORT` | `127.0.0.1` / `3111` | адрес прослушивания |
-| `ADMIN_TOKEN` | пусто | требуется для `POST /v1/accounts`; пусто = эндпоинт открыт (только для localhost) |
-| `DATA_DIR` | `./data` | реестр аккаунтов и лог обновлений (режим `0600`) |
-| `LOG_UPDATES` | `false` | писать поток обновлений в `data/updates.jsonl` |
-| `UPDATES_MAX_MB` | `50` | порог ротации лога |
+| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | — | required |
+| `HOST` / `PORT` | `127.0.0.1` / `3111` | listen address |
+| `ADMIN_TOKEN` | empty | required for `POST /v1/accounts`; empty = the endpoint is open (localhost only) |
+| `DATA_DIR` | `./data` | account registry and updates log (mode `0600`) |
+| `LOG_UPDATES` | `false` | write the update stream to `data/updates.jsonl` |
+| `UPDATES_MAX_MB` | `50` | log rotation threshold |
 
-## Быстрый старт
+## Quick start
 
 ```bash
 BASE=http://127.0.0.1:3111/v1
 
-# 1. Создать аккаунт — apiToken показывается один раз
+# 1. Create an account — apiToken is shown exactly once
 curl -X POST $BASE/accounts -H 'content-type: application/json' -d '{"name":"my"}'
 # -> { "accountId": "acc_…", "apiToken": "tok_…", "status": "no_session" }
 
 ACC=acc_…; TOKEN=tok_…
 AUTH="Authorization: Bearer $TOKEN"
 
-# 2. Логин: телефон → код → (2FA, если включён)
+# 2. Log in: phone → code → (2FA, if enabled)
 curl -X POST $BASE/accounts/$ACC/auth/send-code   -H "$AUTH" -H 'content-type: application/json' -d '{"phone":"+79991234567"}'
 curl -X POST $BASE/accounts/$ACC/auth/verify-code -H "$AUTH" -H 'content-type: application/json' -d '{"code":"12345"}'
-# -> { "next": "done", "me": {…} }  либо  { "next": "password" }
+# -> { "next": "done", "me": {…} }  or  { "next": "password" }
 curl -X POST $BASE/accounts/$ACC/auth/password    -H "$AUTH" -H 'content-type: application/json' -d '{"password":"…"}'
 
-# 3. Отправить сообщение
+# 3. Send a message
 curl -X POST $BASE/accounts/$ACC/chat/@username/messages -H "$AUTH" -H 'content-type: application/json' -d '{"text":"hello"}'
 
-# 4. Отправить файлы (до 10 за раз, поле формы — files)
-curl -X POST $BASE/accounts/$ACC/chat/@username/files -H "$AUTH" -F files=@photo.jpg -F caption=Привет
+# 4. Send files (up to 10 at a time, form field is `files`)
+curl -X POST $BASE/accounts/$ACC/chat/@username/files -H "$AUTH" -F files=@photo.jpg -F caption=Hi
 ```
 
-## Эндпоинты
+## Endpoints
 
-Все, кроме `POST /v1/accounts` и `GET /v1/health`, требуют `Authorization: Bearer <apiToken>`.
+Everything except `POST /v1/accounts` and `GET /v1/health` requires
+`Authorization: Bearer <apiToken>`.
 
 ```
-GET    /v1/health                                     проверка живости
+GET    /v1/health                                     liveness probe
 
-# Аккаунты и авторизация
-POST   /v1/accounts                                   создать аккаунт (ADMIN_TOKEN, если задан)
-GET    /v1/accounts                                   свои аккаунты
-DELETE /v1/accounts/:id                               удалить аккаунт
-POST   /v1/accounts/:id/auth/send-code                { phone } → код
+# Accounts and authorization
+POST   /v1/accounts                                   create an account (ADMIN_TOKEN, if set)
+GET    /v1/accounts                                   your own accounts
+DELETE /v1/accounts/:id                               delete an account
+POST   /v1/accounts/:id/auth/send-code                { phone } → code
 POST   /v1/accounts/:id/auth/verify-code              { code } → { next: "done"|"password" }
 POST   /v1/accounts/:id/auth/password                 { password } — 2FA
-POST   /v1/accounts/:id/auth/logout                   логаут (сессия отзывается в Telegram)
+POST   /v1/accounts/:id/auth/logout                   log out (the session is revoked in Telegram)
 GET    /v1/accounts/:id/auth/status                   { status, next?, me? }
 
-# Профиль
+# Profile
 GET    /v1/accounts/:id/me                            getMe
 POST   /v1/accounts/:id/me                            JSON { firstName, lastName, about }
-                                                      либо multipart с полем avatar
+                                                      or multipart with an `avatar` field
 GET    /v1/accounts/:id/status                        { online, status }
-POST   /v1/accounts/:id/status                        { online } — присутствие
+POST   /v1/accounts/:id/status                        { online } — presence
 
-# Диалоги и чаты
+# Dialogs and chats
 GET    /v1/accounts/:id/dialogs?limit&archived&query
-GET    /v1/accounts/:id/chat/:peer                    информация о чате
+GET    /v1/accounts/:id/chat/:peer                    chat info
 GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&reverse
 
-# Сообщения
+# Messages
 POST   /v1/accounts/:id/chat/:peer/messages           { text, replyTo? }
 POST   /v1/accounts/:id/chat/:peer/files              multipart: files[], caption, replyTo, forceDocument
 PATCH  /v1/accounts/:id/chat/:peer/messages/:msgId    { text }
@@ -111,11 +151,11 @@ DELETE /v1/accounts/:id/chat/:peer/messages?ids=1,2&revoke=true
 POST   /v1/accounts/:id/chat/:peer/messages/:msgId/react   { emoji }
 POST   /v1/accounts/:id/chat/:peer/read               { maxId }
 POST   /v1/accounts/:id/chat/:peer/forward            { ids, fromPeer }
-GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    скачать медиа
+GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    download media
 ```
 
-`:peer` — `@username`, `username`, числовой ID (`-1001234567890`) или `me`.
-Значение подставляйте через `encodeURIComponent`.
+`:peer` is `@username`, `username`, a numeric ID (`-1001234567890`) or `me`.
+Always pass it through `encodeURIComponent`.
 
 ## WebSocket
 
@@ -123,53 +163,71 @@ GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    скачать мед
 ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>
 ```
 
-Подключение поднимает клиента Telegram для аккаунта, если он ещё не поднят.
-Один аккаунт может держать несколько сокетов — поток получают все.
+Connecting spins up the Telegram client for the account if it is not running yet.
+One account may hold several sockets — all of them receive the stream.
 
-События (`JSON`, все с `accountEvent: true`):
+Events (`JSON`, every one carries `accountEvent: true`):
 
-| `type` | Полезная нагрузка |
+| `type` | Payload |
 |---|---|
-| `connected` | `accountId` — подтверждение подписки |
-| `new_message` / `edited_message` | `message` — нормализованное сообщение |
+| `connected` | `accountId` — subscription confirmed |
+| `new_message` / `edited_message` | `message` — normalized message |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |
 | `read_inbox` | `peerId`, `maxId` |
-| `session_closed` | `reason` — логаут, сокет закрывается кодом `4003` |
-| `error` | `error` — сессия недоступна, сокет закрывается кодом `4002` |
+| `session_closed` | `reason` — logged out, the socket closes with code `4003` |
+| `error` | `error` — session unavailable, the socket closes with code `4002` |
 
-Коды закрытия: `4001` — неверный токен или аккаунт не авторизован,
-`4002` — сессия недоступна, `4003` — логаут.
+Close codes: `4001` — bad token or the account is not authorized,
+`4002` — session unavailable, `4003` — logged out.
 
-## Ошибки
+## Errors
 
 `{ error, message, step?, hint?, seconds? }`.
 
-| Статус | Когда |
+| Status | When |
 |---|---|
-| 400 | неверные данные или нарушен порядок шагов логина (`step` укажет шаг) |
-| 401 | нет/неверный `apiToken` |
-| 403 | нет доступа к чату |
-| 404 | чат, сообщение или медиа не найдены |
-| 409 | аккаунт не авторизован или сессия отозвана |
-| 429 | `flood_wait`, в `seconds` — сколько ждать |
+| 400 | invalid payload, or the login steps are out of order (`step` names the expected one) |
+| 401 | missing or wrong `apiToken` |
+| 403 | no access to the chat |
+| 404 | chat, message or media not found |
+| 409 | the account is not authorized, or the session was revoked |
+| 429 | `flood_wait`, `seconds` says how long to wait |
 
-## Ограничения
+## Security
 
-- Сессии хранятся в `StringSession` без кэша сущностей: после рестарта обращение к чату
-  по числовому ID может вернуть `peer_not_found` — сначала вызовите `GET /dialogs`,
-  это прогреет кэш.
-- Регистрация новых номеров, звонки, секретные чаты и вход по email не поддерживаются.
-- CORS не настроен: браузерный клиент требует прокси.
+- **Sessions are credentials.** `data/accounts.json` holds `sessionString` values that grant
+  full access to the Telegram accounts. The file is written with mode `0600` and the whole
+  `data/` directory is git-ignored. Never commit it, never move it into a synced folder.
+- **`ADMIN_TOKEN` gates account creation.** While it is empty, `POST /v1/accounts` is open to
+  anyone who can reach the port. That is acceptable only on `127.0.0.1`; the server prints a
+  warning at startup if it listens elsewhere without the token.
+- **`apiToken` is shown exactly once**, in the `POST /v1/accounts` response. It is not
+  recoverable — a lost token means deleting and recreating the account.
+- **`LOG_UPDATES=true` writes message text to disk** (`data/updates.jsonl`). It is off by
+  default; keep it that way unless you actually need the audit trail.
+- **No TLS, no CORS.** Put the gateway behind a reverse proxy before exposing it.
 
-## Тесты
+## Limitations
+
+- Sessions are stored as a `StringSession` with no entity cache: after a restart, addressing a
+  chat by numeric ID may return `peer_not_found` — call `GET /dialogs` first to warm the cache.
+- Registering new phone numbers, calls, secret chats and email login are not supported.
+- CORS is not configured: a browser client needs a proxy.
+
+## Tests
 
 ```bash
 npm test
 ```
 
-Внимание: тесты реестра сейчас пишут в боевой `data/accounts.json` (см. `test/unit.test.js`).
+Note: the registry tests currently write to the live `data/accounts.json` (see
+`test/unit.test.js`).
 
-## Документация
+## Changelog
 
-Дизайн и исходная спека — `docs/superpowers/specs/2026-08-29-apigram-design.md`.
+See [CHANGELOG.md](./CHANGELOG.md).
+
+## License
+
+ISC

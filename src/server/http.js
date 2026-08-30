@@ -1,3 +1,8 @@
+/**
+ * Сборка Express-приложения: парсеры, аутентификация, роутер, обработка ошибок.
+ * Сами эндпоинты живут в router.js — здесь только каркас и то, что должно
+ * выполняться до/после всех маршрутов.
+ */
 import express from "express";
 import multer from "multer";
 import { getAccount, listAccounts } from "./accounts.js";
@@ -5,6 +10,8 @@ import { bearerToken } from "./bearer.js";
 import { buildRouter } from "./router.js";
 import { toHttpError } from "./httpErrors.js";
 
+// Файлы держим в памяти: они сразу уходят в Telegram, писать их на диск незачем —
+// это лишний след с пользовательским контентом. Отсюда и жёсткие лимиты размера.
 const uploadFiles = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 50 * 1024 * 1024 },
@@ -28,6 +35,8 @@ export function createHttpApp() {
         res.json({ ok: true, version: "1.0.0" });
     });
 
+    // Список аккаунтов токена. Пустой результат означает, что токен не опознан:
+    // отдельного «покажи все аккаунты» здесь нет и быть не должно.
     app.get("/v1/accounts", (req, res) => {
         const accounts = listAccounts(bearerToken(req));
         if (accounts.length === 0) return res.status(401).json({ error: "invalid_token" });
@@ -35,10 +44,14 @@ export function createHttpApp() {
     });
 
     // Единая Bearer-проверка на всё, что адресовано конкретному аккаунту.
+    // Дальше по цепочке req.account уже гарантированно принадлежит владельцу токена,
+    // поэтому обработчики маршрутов прав больше не проверяют.
     app.use("/v1/accounts/:accountId", (req, res, next) => {
         const account = getAccount(req.params.accountId, bearerToken(req));
         if (!account) return res.status(401).json({ error: "invalid_token" });
         req.account = account;
+        // Multer-обработчики прокидываем в req: роутер вызывает их вручную, только
+        // для multipart-запросов, чтобы не парсить форму там, где ждём JSON.
         req.uploadFiles = uploadFiles;
         req.uploadAvatar = uploadAvatar;
         next();
@@ -50,6 +63,8 @@ export function createHttpApp() {
         res.status(404).json({ error: "not_found", message: `Нет такого эндпоинта: ${req.method} ${req.originalUrl}` });
     });
 
+    // Единственная точка, где ошибка превращается в HTTP-ответ. Четыре аргумента
+    // обязательны — по их числу Express опознаёт error-middleware.
     // eslint-disable-next-line no-unused-vars
     app.use((err, req, res, next) => {
         const { status, body } = toHttpError(err);

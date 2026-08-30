@@ -30,7 +30,10 @@
     "src",
     "run.sh",
     ".env.example",
-    "README.md"
+    "README.md",
+    "README.ru.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "node --test test/unit.test.js",

@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+/**
+ * Точка входа: поднимает HTTP-сервер, вешает на него WebSocket и обеспечивает
+ * корректную остановку по сигналу.
+ *
+ * Порядок важен: сначала проверяем ключи (иначе первый же запрос упадёт невнятной
+ * ошибкой teleproto), потом слушаем порт, и только затем привязываем WS — серверу
+ * нужен уже созданный http.Server.
+ */
 import { createHttpApp } from "./server/http.js";
 import { attachWs } from "./server/ws.js";
 import { startUpdatesLog, stopUpdatesLog } from "./server/updatesLog.js";
@@ -13,6 +21,8 @@ const server = app.listen(config.port, config.host, () => {
     if (startUpdatesLog()) {
         console.log(`apiGram updates log: ${config.updatesFile} (ротация ${config.updatesMaxMb} MB)`);
     }
+    // Пустой ADMIN_TOKEN оставляет POST /v1/accounts открытым. На localhost это
+    // осознанное удобство, на любом другом адресе — дыра, о которой нужно сказать вслух.
     if (!config.adminToken && config.host !== "127.0.0.1" && config.host !== "localhost") {
         console.warn(
             "ВНИМАНИЕ: ADMIN_TOKEN не задан, а сервер слушает не только localhost —\n" +
@@ -24,10 +34,18 @@ const server = app.listen(config.port, config.host, () => {
 const wss = attachWs(server);
 
 let shuttingDown = false;
+
+/**
+ * Graceful shutdown: закрыть сокеты, отключить клиентов Telegram, дождаться
+ * закрытия HTTP-сервера. Повторные сигналы игнорируются.
+ * @param {string} signal
+ */
 async function shutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`apiGram: получен ${signal}, останавливаюсь…`);
+    // Страховка от зависшего disconnect: через 5 секунд выходим в любом случае.
+    // unref, чтобы сам таймер не держал event loop, если всё закрылось раньше.
     const force = setTimeout(() => process.exit(0), 5000);
     force.unref();
     try {

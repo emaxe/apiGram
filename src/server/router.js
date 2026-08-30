@@ -1,3 +1,11 @@
+/**
+ * Все эндпоинты `/v1`, кроме health и списка аккаунтов (те заданы в http.js).
+ *
+ * Каждый обработчик устроен одинаково: достать клиента через `getClient(req)`,
+ * вызвать модуль из `telegram/`, отдать результат. Ошибки не разбираются на месте —
+ * уходят в `next(err)` и превращаются в HTTP-код единым маппером `toHttpError`.
+ * Права здесь уже проверены Bearer-мидлварой в http.js: `req.account` доверенный.
+ */
 import { Router } from "express";
 import { makeAccount, removeAccount, toPublic, accountStore } from "./accounts.js";
 import { isAdmin, bearerToken } from "./bearer.js";
@@ -18,6 +26,8 @@ export function buildRouter() {
         res.status(201).json({ ...toPublic(account), apiToken: account.apiToken });
     });
 
+    // Сначала detach (закрыть клиента и уведомить сокеты), потом удаление из реестра:
+    // в обратном порядке живой клиент остался бы висеть без записи в реестре.
     r.delete("/accounts/:accountId", async (req, res, next) => {
         try {
             await sessionManager.detach(req.account.accountId);
@@ -27,11 +37,17 @@ export function buildRouter() {
     });
 
     // ── Авторизация ───────────────────────────────────────────────
+    // Трёхшаговый вход: send-code → verify-code → (password, если включён 2FA).
+    // Состояние между шагами живёт в реестре, поэтому рестарт процесса
+    // не роняет начатый логин.
+
     r.post("/accounts/:accountId/auth/send-code", async (req, res, next) => {
         try {
             const { phone } = req.body || {};
             if (!phone) return res.status(400).json({ error: "phone_required", step: "send-code" });
             const result = await authApi.sendCode(req.account, phone);
+            // phoneCodeHash намеренно не сохраняем в реестр: он привязан к живому
+            // клиенту, который держит sessionManager, и на диске бесполезен.
             accountStore.saveAuthorized(req.account.accountId, {
                 phone,
                 status: "code_sent",
@@ -46,6 +62,8 @@ export function buildRouter() {
             const { code } = req.body || {};
             if (!code) return res.status(400).json({ error: "code_required", step: "verify-code" });
             const result = await authApi.verifyCode(req.account, accountStore, code);
+            // Верный код при включённом 2FA — ещё не вход: клиент остаётся поднятым
+            // и ждёт пароль следующим запросом.
             if (result.next === "password") {
                 accountStore.saveAuthorized(req.account.accountId, { status: "awaiting_2fa" });
                 return res.json({ next: "password" });
@@ -63,6 +81,7 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // Логаут отзывает сессию в Telegram — она станет непригодна и на других устройствах.
     r.post("/accounts/:accountId/auth/logout", async (req, res, next) => {
         try {
             await authApi.logout(req.account, accountStore);
@@ -70,6 +89,8 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // Читает только реестр, без обращения к Telegram: дёшево и работает,
+    // даже когда сессия отозвана.
     r.get("/accounts/:accountId/auth/status", (req, res) => {
         res.json(authApi.authStatus(req.account));
     });
@@ -82,6 +103,8 @@ export function buildRouter() {
     });
 
     // JSON — имя/фамилия/био; multipart с полем `avatar` — аватарка.
+    // Один маршрут на оба случая: клиенту удобнее слать частичный патч профиля
+    // и картинку одним запросом.
     r.post("/accounts/:accountId/me", async (req, res, next) => {
         if (!isMultipart(req)) {
             try {
@@ -97,6 +120,8 @@ export function buildRouter() {
                 if (req.file?.buffer) {
                     await prof.setProfilePhoto(client, req.file.buffer);
                 }
+                // Текстовых полей могло и не быть — тогда просто возвращаем
+                // актуальный профиль, чтобы ответ был одинаковой формы.
                 const patch = pickProfileFields(req.body || {});
                 const result = Object.keys(patch).length
                     ? await prof.updateProfile(client, patch)
@@ -107,12 +132,15 @@ export function buildRouter() {
     });
 
     // ── Диалоги и чаты ────────────────────────────────────────────
+    // Вызов dialogs заодно прогревает кэш сущностей: после рестарта это
+    // единственный способ научить клиента резолвить чаты по числовому ID.
     r.get("/accounts/:accountId/dialogs", async (req, res, next) => {
         try {
             const client = await getClient(req);
             const { limit, archived, query } = req.query;
             const dialogs = await dlg.fetchDialogs(client, {
                 limit: parseInt(limit || "100", 10),
+                // undefined — «без фильтра», в отличие от явного false.
                 archived: archived === undefined ? undefined : archived === "true",
                 query,
             });
@@ -151,6 +179,8 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // Multipart: поле `files` (до 10 штук), остальные поля приходят строками —
+    // отсюда ручное приведение replyTo и forceDocument.
     r.post("/accounts/:accountId/chat/:peer/files", (req, res, next) => {
         req.uploadFiles(req, res, async (uploadErr) => {
             if (uploadErr) return next(uploadErr);
@@ -176,6 +206,8 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // ids приходят строкой query-параметра: "1,2,3". revoke по умолчанию true —
+    // удаление у всех участников, а не только у себя.
     r.delete("/accounts/:accountId/chat/:peer/messages", async (req, res, next) => {
         try {
             const client = await getClient(req);
@@ -199,6 +231,7 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // maxId = 0 означает «прочитать всё до последнего сообщения».
     r.post("/accounts/:accountId/chat/:peer/read", async (req, res, next) => {
         try {
             const client = await getClient(req);
@@ -207,6 +240,7 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // :peer здесь — куда пересылаем, fromPeer в теле — откуда.
     r.post("/accounts/:accountId/chat/:peer/forward", async (req, res, next) => {
         try {
             const client = await getClient(req);
@@ -219,6 +253,8 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // Единственный маршрут, отдающий не JSON, а бинарь. filename* с UTF-8 —
+    // чтобы не терять кириллицу и эмодзи в именах файлов.
     r.get("/accounts/:accountId/chat/:peer/messages/:msgId/file", async (req, res, next) => {
         try {
             const client = await getClient(req);
@@ -235,6 +271,7 @@ export function buildRouter() {
     });
 
     // ── Статус присутствия ─────────────────────────────────────────
+    // Отдельного «мой статус» в TL нет — вытаскиваем его из getMe.
     r.get("/accounts/:accountId/status", async (req, res, next) => {
         try {
             const me = await prof.getMe(await getClient(req));
@@ -255,7 +292,11 @@ export function buildRouter() {
 
 // ── Хелперы ─────────────────────────────────────────────────────
 
-/** @param {import("express").Request} req */
+/**
+ * Клиент Telegram для аккаунта запроса. Поднимает сессию при первом обращении
+ * и переиспользует её дальше — вызывать напрямую buildClient нельзя.
+ * @param {import("express").Request} req
+ */
 async function getClient(req) {
     return sessionManager.getClient(req.account);
 }
@@ -265,7 +306,11 @@ function isMultipart(req) {
     return String(req.headers["content-type"] || "").includes("multipart/form-data");
 }
 
-/** Оставляет только поля профиля, которые реально пришли. */
+/**
+ * Оставляет только поля профиля, которые реально пришли.
+ * Отсутствие ключа и пустая строка — разные вещи: пустую строку Telegram
+ * принимает как «стереть значение», поэтому проверяем именно на undefined.
+ */
 function pickProfileFields(body) {
     const patch = {};
     for (const key of ["firstName", "lastName", "about"]) {

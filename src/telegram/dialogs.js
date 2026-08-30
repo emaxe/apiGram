@@ -73,12 +73,17 @@ function detectType(dialog, entity) {
  */
 export async function fetchDialogs(client, { limit = 100, archived, query } = {}) {
     const params = { limit };
+    // Только явный boolean: undefined означает «и активные, и архивные».
     if (typeof archived === "boolean") params.archived = archived;
     const dialogs = [];
+    // Побочный, но важный эффект обхода: заодно прогревается кэш сущностей,
+    // без которого чаты по числовому ID не резолвятся после рестарта.
     for await (const dialog of client.iterDialogs(params)) {
         dialogs.push(normalizeDialog(dialog));
         if (query && dialogs.length >= limit) break;
     }
+    // Поиска по диалогам в TL нет — фильтруем уже загруженную страницу.
+    // Значит query ищет в пределах limit, а не по всему списку чатов.
     if (query) {
         const q = String(query).toLowerCase();
         return dialogs.filter((d) =>

@@ -28,9 +28,13 @@ export function parsePeer(raw) {
     const value = String(raw || "").trim();
     if (!value) throw new ProtocolError("peer_required", "Не указан идентификатор чата (peer).");
     if (value === "me" || value === "self") return "me";
+    // Числовой ID отдаём BigInt: ID каналов и супергрупп давно вышли за 2^53,
+    // и обычный Number терял бы последние цифры.
     if (/^-?\d+$/.test(value)) {
         return BigInt(value);
     }
+    // Собачку добавляем сами: getEntity отличает username от строкового ID
+    // именно по ней, и без префикса «durov» ушёл бы резолвиться как ID.
     return value.startsWith("@") ? value : `@${value}`;
 }
 
