@@ -1,6 +1,12 @@
 node_modules/
 data/
 .env
+.env.*
+!.env.example
 *.log
+*.jsonl
+*.session
+*.session-journal
 .DS_Store
 *.tgz
+docs/superpowers/

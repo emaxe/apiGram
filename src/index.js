@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { createHttpApp } from "./server/http.js";
 import { attachWs } from "./server/ws.js";
 import { startUpdatesLog, stopUpdatesLog } from "./server/updatesLog.js";

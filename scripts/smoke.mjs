@@ -85,20 +85,19 @@ async function api(method, url, { body, token, form, raw } = {}) {
 
 /** Ввод без эха — для 2FA-пароля. */
 async function secret(question) {
+    // Читаем тем же readline, который уже владеет stdin: собственный async-итератор
+    // над stdin уничтожил бы поток на выходе из цикла и уронил бы rl с ABORT_ERR.
+    // Эхо гасим подменой stdout.write на время ввода.
     stdout.write(question);
-    const wasRaw = Boolean(stdin.isRaw);
-    stdin.setRawMode?.(true);
-    let value = "";
-    for await (const chunk of stdin) {
-        const key = chunk.toString("utf8");
-        if (key === "\r" || key === "\n") break;
-        if (key === "") { stdin.setRawMode?.(wasRaw); process.exit(1); }
-        if (key === "" || key === "\b") { value = value.slice(0, -1); continue; }
-        value += key;
+    const own = Object.prototype.hasOwnProperty.call(stdout, "write");
+    const write = stdout.write;
+    stdout.write = () => true;
+    try {
+        return await rl.question("");   // без trim: пробелы в пароле значимы
+    } finally {
+        if (own) stdout.write = write; else delete stdout.write;
+        stdout.write("\n");
     }
-    stdin.setRawMode?.(wasRaw);
-    stdout.write("\n");
-    return value;
 }
 
 async function main() {

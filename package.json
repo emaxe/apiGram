@@ -2,18 +2,40 @@
   "name": "apigram",
   "version": "1.0.0",
   "description": "Multi-user Telegram API gateway (MTProto) — REST + WebSocket",
-  "main": "src/index.js",
-  "directories": {
-    "doc": "docs"
+  "keywords": [
+    "telegram",
+    "mtproto",
+    "gateway",
+    "userbot",
+    "rest",
+    "websocket",
+    "multi-account"
+  ],
+  "author": "emaxe",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/emaxe/apiGram.git"
   },
+  "homepage": "https://github.com/emaxe/apiGram#readme",
+  "bugs": {
+    "url": "https://github.com/emaxe/apiGram/issues"
+  },
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "apigram": "src/index.js"
+  },
+  "files": [
+    "src",
+    "run.sh",
+    ".env.example",
+    "README.md"
+  ],
   "scripts": {
     "test": "node --test test/unit.test.js",
     "start": "node src/index.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "module",
   "dependencies": {
     "dotenv": "^16.6.1",
     "express": "^4.22.2",
