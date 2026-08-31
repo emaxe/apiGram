@@ -22,9 +22,18 @@ const CODE_STATUS = {
     peer_not_found: 404,
     message_not_found: 404,
     no_media: 404,
+    no_thumb: 404,
     // 409 — аккаунт не в том состоянии
     not_authorized: 409,
     session_invalid: 409,
+    // 502/504 — виноват не клиент и не мы, а прокси между нами и Telegram.
+    // 407 наружу не отдаём: это авторизация прокси, а не нашего API.
+    proxy_unreachable: 502,
+    proxy_connect_failed: 502,
+    proxy_protocol_error: 502,
+    proxy_forbidden: 502,
+    proxy_auth_required: 502,
+    proxy_timeout: 504,
 };
 
 /**
@@ -38,6 +47,9 @@ const RAW_PATTERNS = [
     { pattern: /MESSAGE_NOT_MODIFIED|MESSAGE_EMPTY|MESSAGE_TOO_LONG/i, status: 400, code: "message_invalid" },
     { pattern: /REACTION_INVALID|REACTIONS_TOO_MANY/i, status: 400, code: "reaction_invalid" },
     { pattern: /Could not find the input entity|Cannot find any entity/i, status: 404, code: "peer_not_found" },
+    // Последним: у ошибок пакета socks своего кода нет, а паттерн широкий —
+    // выше него стоят все проверки, где сообщение опознаётся точнее.
+    { pattern: /Socks5?\s|SOCKS|Proxy connection timed out|socket closed by the proxy/i, status: 502, code: "proxy_connect_failed" },
 ];
 
 /**

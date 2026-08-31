@@ -15,11 +15,28 @@ import {
 } from "../src/registry/accountsFile.js";
 import { sessionManager } from "../src/telegram/sessionManager.js";
 import { authStatus } from "../src/telegram/auth.js";
-import { normalizeMessage, sendFiles } from "../src/telegram/messages.js";
+import { Api } from "teleproto";
+import { normalizeMessage, sendFiles, openMedia, streamMedia, downloadThumb } from "../src/telegram/messages.js";
+import { describeMedia, chunkPlan, sliceChunks, createDownloadGate, pickThumbType } from "../src/telegram/media.js";
+import { parseRange, mediaResponseHead } from "../src/server/range.js";
 import { normalizeDialog } from "../src/telegram/dialogs.js";
 import { toPlain } from "../src/telegram/serialize.js";
 import { ProtocolError } from "../src/telegram/errors.js";
 import { toHttpError } from "../src/server/httpErrors.js";
+import { parseOrigins, isOriginAllowed, corsMiddleware } from "../src/server/cors.js";
+import { classifyRawUpdate, deletedMessagesEvent } from "../src/telegram/listener.js";
+import { DeletedMessage } from "teleproto/events/index.js";
+import { createHttpApp } from "../src/server/http.js";
+import net from "node:net";
+import { parseProxyUrl, describeProxy, pickProxySource } from "../src/telegram/proxyUrl.js";
+import {
+    buildConnectRequest,
+    parseConnectResponse,
+    readConnectResponse,
+    createProxySocketFactory,
+} from "../src/telegram/proxySocket.js";
+import { proxyClientOptions } from "../src/telegram/client.js";
+import { PromisedNetSockets } from "teleproto/extensions/PromisedNetSockets.js";
 
 test("json: writeJson/readJson round-trip с 0600", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "apigram-"));
@@ -226,5 +243,1271 @@ test("messages: sendFiles заворачивает {name, buffer} в CustomFile"
     await assert.rejects(
         () => sendFiles(client, "me", new Array(11).fill({ name: "x", buffer: Buffer.from("x") })),
         /не больше 10 файлов/
+    );
+});
+
+// ── CORS ──────────────────────────────────────────────────────────────────────
+
+test("cors: parseOrigins разбирает список и чистит хвостовые слэши", () => {
+    assert.deepEqual(parseOrigins("http://a.example , https://b.example/ "), [
+        "http://a.example",
+        "https://b.example",
+    ]);
+    assert.deepEqual(parseOrigins(""), []);
+    assert.deepEqual(parseOrigins(undefined), []);
+    assert.deepEqual(parseOrigins("*"), ["*"]);
+});
+
+test("cors: пустой список запрещает всё", () => {
+    // Состояние по умолчанию: браузерные клиенты к шлюзу не допускаются.
+    assert.equal(isOriginAllowed("http://a.example", []), false);
+});
+
+test("cors: источник сверяется точно, поддомен не подходит", () => {
+    const allowed = ["http://127.0.0.1:8080"];
+    assert.equal(isOriginAllowed("http://127.0.0.1:8080", allowed), true);
+    assert.equal(isOriginAllowed("http://127.0.0.1:8080/", allowed), true);
+    assert.equal(isOriginAllowed("http://127.0.0.1:9090", allowed), false);
+    assert.equal(isOriginAllowed("https://127.0.0.1:8080", allowed), false);
+    assert.equal(isOriginAllowed("http://evil.127.0.0.1:8080", allowed), false);
+});
+
+test("cors: звёздочка разрешает любой источник", () => {
+    assert.equal(isOriginAllowed("https://anything.example", ["*"]), true);
+});
+
+/** Минимальная имитация req/res для проверки middleware. */
+function fakeExchange({ method = "GET", origin } = {}) {
+    const headersSent = {};
+    let statusCode = 200;
+    let ended = false;
+    let nextCalled = false;
+    const res = {
+        setHeader: (name, value) => { headersSent[name] = value; },
+        status(code) { statusCode = code; return res; },
+        end() { ended = true; return res; },
+    };
+    const req = { method, headers: origin ? { origin } : {} };
+    return {
+        req, res, headers: headersSent,
+        get statusCode() { return statusCode; },
+        get ended() { return ended; },
+        get nextCalled() { return nextCalled; },
+        next: () => { nextCalled = true; },
+    };
+}
+
+test("cors: без заголовка Origin запрос проходит нетронутым", () => {
+    // Так ходят не-браузерные клиенты: smoke.mjs, мобильные сборки, curl.
+    const x = fakeExchange();
+    corsMiddleware(["http://a.example"])(x.req, x.res, x.next);
+    assert.equal(x.nextCalled, true);
+    assert.deepEqual(x.headers, {});
+});
+
+test("cors: разрешённому источнику выдаются заголовки и Vary", () => {
+    const x = fakeExchange({ origin: "http://a.example" });
+    corsMiddleware(["http://a.example"])(x.req, x.res, x.next);
+    assert.equal(x.nextCalled, true);
+    assert.equal(x.headers["Access-Control-Allow-Origin"], "http://a.example");
+    // Без Vary промежуточный кеш отдал бы заголовки одного источника другому.
+    assert.equal(x.headers["Vary"], "Origin");
+    // Без этого клиент не прочитает имя и размер скачиваемого вложения.
+    assert.match(x.headers["Access-Control-Expose-Headers"], /Content-Disposition/);
+});
+
+test("cors: предварительный запрос завершается 204 и не идёт в маршруты", () => {
+    const x = fakeExchange({ method: "OPTIONS", origin: "http://a.example" });
+    corsMiddleware(["http://a.example"])(x.req, x.res, x.next);
+    assert.equal(x.statusCode, 204);
+    assert.equal(x.ended, true);
+    assert.equal(x.nextCalled, false);
+    assert.match(x.headers["Access-Control-Allow-Headers"], /Authorization/);
+    assert.match(x.headers["Access-Control-Allow-Methods"], /PATCH/);
+});
+
+test("cors: предварительный запрос чужого источника отклоняется", () => {
+    const x = fakeExchange({ method: "OPTIONS", origin: "http://evil.example" });
+    corsMiddleware(["http://a.example"])(x.req, x.res, x.next);
+    assert.equal(x.statusCode, 403);
+    assert.equal(x.nextCalled, false);
+});
+
+test("cors: обычный запрос чужого источника идёт дальше, но без заголовков", () => {
+    // Ответ браузер всё равно не отдаст странице — заголовков разрешения нет.
+    const x = fakeExchange({ origin: "http://evil.example" });
+    corsMiddleware(["http://a.example"])(x.req, x.res, x.next);
+    assert.equal(x.nextCalled, true);
+    assert.equal(x.headers["Access-Control-Allow-Origin"], undefined);
+});
+
+// ── классификация сырых апдейтов ──────────────────────────────────────────────
+
+test("listener: набор текста превращается в событие typing", () => {
+    const event = classifyRawUpdate({
+        className: "UpdateUserTyping",
+        userId: 1000000002,
+        action: { className: "SendMessageRecordAudioAction" },
+    });
+    assert.equal(event.type, "typing");
+    // В личке чата нет — идентификатором служит сам собеседник.
+    assert.equal(event.chatId, "1000000002");
+    assert.equal(event.userId, "1000000002");
+    assert.equal(event.action, "SendMessageRecordAudioAction");
+});
+
+test("listener: действие по умолчанию — набор текста", () => {
+    const event = classifyRawUpdate({ className: "UpdateChatUserTyping", userId: 5 });
+    assert.equal(event.action, "SendMessageTypingAction");
+});
+
+test("listener: мы прочитали чужие сообщения — read_inbox", () => {
+    const event = classifyRawUpdate({
+        className: "UpdateReadHistoryInbox",
+        peer: { value: 1000000002 },
+        maxId: 512,
+    });
+    assert.equal(event.type, "read_inbox");
+    assert.equal(event.peerId, "1000000002");
+    assert.equal(event.maxId, 512);
+});
+
+test("listener: собеседник прочитал наши сообщения — read_outbox", () => {
+    // Без этого события клиент не может отличить «доставлено» от «прочитано»
+    // и вынужден не рисовать вторую галочку вовсе.
+    const event = classifyRawUpdate({
+        className: "UpdateReadHistoryOutbox",
+        peer: { value: 1000000002 },
+        maxId: 88213,
+    });
+    assert.equal(event.type, "read_outbox");
+    assert.equal(event.peerId, "1000000002");
+    assert.equal(event.maxId, 88213);
+    assert.equal(event.accountEvent, true);
+});
+
+test("listener: read_outbox канала приходит с маркированным id", () => {
+    const event = classifyRawUpdate({
+        className: "UpdateReadChannelOutbox",
+        channelId: 1500000001,
+        maxId: 40,
+    });
+    assert.equal(event.type, "read_outbox");
+    // Канал обязан быть промаркирован: клиент ищет чат именно по такому id.
+    assert.equal(event.peerId, "-1001500000001");
+});
+
+test("listener: посторонние апдейты отбрасываются", () => {
+    assert.equal(classifyRawUpdate({ className: "UpdateSomethingElse" }), null);
+    assert.equal(classifyRawUpdate({}), null);
+    assert.equal(classifyRawUpdate(null), null);
+    assert.equal(classifyRawUpdate(undefined), null);
+});
+
+test("health: версия берётся из package.json, а не из строки в коде", async () => {
+    // Версию из /v1/health клиент показывает на экране подключения и по ней же
+    // сверяет контракт. Зашитая в код копия расходится с настоящей молча,
+    // поэтому единственный источник — package.json.
+    const expected = JSON.parse(
+        fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")
+    ).version;
+
+    const server = createHttpApp().listen(0, "127.0.0.1");
+    await new Promise((resolve) => server.once("listening", resolve));
+    try {
+        const { port } = server.address();
+        const res = await fetch(`http://127.0.0.1:${port}/v1/health`);
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.ok, true);
+        assert.equal(body.version, expected);
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
+// ── описание медиа ────────────────────────────────────────────────────────────
+
+test("media: фотография отдаёт размеры и инлайн-превью до загрузки", () => {
+    // Пузырь рисует заглушку по width/height ещё до первого байта файла —
+    // иначе список дёргается на каждой подгруженной картинке.
+    const info = describeMedia({
+        className: "MessageMediaPhoto",
+        photo: {
+            className: "Photo",
+            id: 1,
+            sizes: [
+                { className: "PhotoStrippedSize", type: "i", bytes: Buffer.from([1, 2, 3]) },
+                { className: "PhotoSize", type: "m", w: 320, h: 240, size: 8000 },
+                { className: "PhotoSizeProgressive", type: "x", w: 1280, h: 960, sizes: [1000, 90000] },
+            ],
+        },
+    });
+    assert.equal(info.kind, "photo");
+    assert.equal(info.width, 1280);
+    assert.equal(info.height, 960);
+    // У прогрессивного размера вес — последний элемент sizes, а не сам массив.
+    assert.equal(info.size, 90000);
+    assert.equal(info.downloadable, true);
+    assert.equal(info.stripped, Buffer.from([1, 2, 3]).toString("base64"));
+    // Обрезки перечислены по возрастанию, без служебных stripped/path.
+    assert.deepEqual(info.thumbs, [
+        { type: "m", width: 320, height: 240, size: 8000 },
+        { type: "x", width: 1280, height: 960, size: 90000 },
+    ]);
+});
+
+test("media: размер документа приходит BigInteger'ом и обязан стать числом", () => {
+    // teleproto отдаёт long как BigInteger; без приведения размер уезжает в
+    // ответ объектом, и клиент не может решить, стоит ли качать файл.
+    const big = { toString: () => "209715200", isZero: () => false, add: () => big };
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "video/mp4",
+            size: big,
+            attributes: [
+                { className: "DocumentAttributeFilename", fileName: "clip.mp4" },
+                { className: "DocumentAttributeVideo", duration: 12.5, w: 1920, h: 1080, supportsStreaming: true },
+            ],
+        },
+    });
+    assert.equal(info.kind, "video");
+    assert.equal(info.size, 209715200);
+    assert.equal(info.fileName, "clip.mp4");
+    assert.equal(info.mimeType, "video/mp4");
+    assert.equal(info.duration, 12.5);
+    assert.equal(info.width, 1920);
+    assert.equal(info.height, 1080);
+    assert.equal(info.supportsStreaming, true);
+});
+
+test("media: кружок отличается от обычного видео", () => {
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "video/mp4",
+            size: 300000,
+            attributes: [{ className: "DocumentAttributeVideo", duration: 5, w: 384, h: 384, roundMessage: true }],
+        },
+    });
+    assert.equal(info.kind, "round");
+});
+
+test("media: голосовое отдаёт развёрнутую waveform, а не буфер", () => {
+    // Сырая waveform упакована по 5 бит; в JSON она ушла бы как
+    // {_type:"buffer"} и клиенту пришлось бы распаковывать её самому.
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "audio/ogg",
+            size: 4096,
+            attributes: [{
+                className: "DocumentAttributeAudio",
+                voice: true,
+                duration: 3,
+                waveform: Buffer.from([0x1f, 0x00, 0x00, 0x00, 0x00]),
+            }],
+        },
+    });
+    assert.equal(info.kind, "voice");
+    assert.equal(info.duration, 3);
+    assert.deepEqual(info.waveform, [31, 0, 0, 0, 0, 0, 0, 0]);
+});
+
+test("media: музыка — не голосовое, у неё есть исполнитель", () => {
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "audio/mpeg",
+            size: 5000000,
+            attributes: [{
+                className: "DocumentAttributeAudio",
+                duration: 245,
+                title: "Песня",
+                performer: "Кто-то",
+            }],
+        },
+    });
+    assert.equal(info.kind, "audio");
+    assert.equal(info.title, "Песня");
+    assert.equal(info.performer, "Кто-то");
+    assert.equal(info.waveform, null);
+});
+
+test("media: gif опознаётся по атрибуту, а не по mime", () => {
+    // Telegram отдаёт «гифки» как video/mp4 без звука: по mime они
+    // неотличимы от обычного видео, отличает их DocumentAttributeAnimated.
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "video/mp4",
+            size: 120000,
+            attributes: [
+                { className: "DocumentAttributeAnimated" },
+                { className: "DocumentAttributeVideo", duration: 2, w: 400, h: 300 },
+            ],
+        },
+    });
+    assert.equal(info.kind, "gif");
+    assert.equal(info.isAnimated, true);
+});
+
+test("media: стикер важнее изображения и видео", () => {
+    // Видеостикер несёт и DocumentAttributeVideo, и DocumentAttributeSticker;
+    // нарисовать его как видео значит показать пузырь с плеером.
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "video/webm",
+            size: 30000,
+            attributes: [
+                { className: "DocumentAttributeVideo", duration: 3, w: 512, h: 512 },
+                { className: "DocumentAttributeSticker", alt: "🔥", stickerset: { className: "InputStickerSetEmpty" } },
+            ],
+        },
+    });
+    assert.equal(info.kind, "sticker");
+    assert.equal(info.emoji, "🔥");
+});
+
+test("media: обрезки документа перечисляются отдельно от самого файла", () => {
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "application/pdf",
+            size: 700000,
+            thumbs: [
+                { className: "PhotoStrippedSize", type: "i", bytes: Buffer.from([9]) },
+                { className: "PhotoSize", type: "m", w: 90, h: 128, size: 3000 },
+            ],
+            attributes: [{ className: "DocumentAttributeFilename", fileName: "договор.pdf" }],
+        },
+    });
+    assert.equal(info.kind, "document");
+    assert.equal(info.size, 700000);
+    assert.deepEqual(info.thumbs, [{ type: "m", width: 90, height: 128, size: 3000 }]);
+    assert.equal(info.stripped, Buffer.from([9]).toString("base64"));
+    // Размеров у произвольного файла нет — заглушка рисуется как строка, а не
+    // как прямоугольник наугад.
+    assert.equal(info.width, null);
+    assert.equal(info.height, null);
+});
+
+test("media: спойлер доходит до клиента", () => {
+    const info = describeMedia({
+        className: "MessageMediaPhoto",
+        spoiler: true,
+        photo: { className: "Photo", sizes: [{ className: "PhotoSize", type: "m", w: 10, h: 10, size: 100 }] },
+    });
+    assert.equal(info.spoiler, true);
+});
+
+test("media: гео, контакт и опрос описываются, но не качаются", () => {
+    for (const [raw, kind] of [
+        [{ className: "MessageMediaGeo" }, "geo"],
+        [{ className: "MessageMediaGeoLive" }, "geo"],
+        [{ className: "MessageMediaVenue" }, "venue"],
+        [{ className: "MessageMediaContact" }, "contact"],
+        [{ className: "MessageMediaPoll" }, "poll"],
+        [{ className: "MessageMediaDice" }, "dice"],
+        [{ className: "MessageMediaWebPage" }, "webpage"],
+    ]) {
+        const info = describeMedia(raw);
+        assert.equal(info.kind, kind);
+        // Кнопки «скачать» у такого медиа быть не должно: файла за ним нет.
+        assert.equal(info.downloadable, false, kind);
+    }
+});
+
+test("media: пустое и незнакомое медиа не роняют нормализацию", () => {
+    assert.equal(describeMedia(null), null);
+    assert.equal(describeMedia(undefined), null);
+    assert.equal(describeMedia({ className: "MessageMediaEmpty" }), null);
+    // Новый тип медиа появляется раньше, чем его поддержка: он обязан доехать
+    // до клиента заглушкой, а не исключением.
+    const unknown = describeMedia({ className: "MessageMediaGiveawayResults" });
+    assert.equal(unknown.kind, "unsupported");
+    assert.equal(unknown.downloadable, false);
+});
+
+test("media: описание переживает JSON.stringify", () => {
+    // Всё, что уходит в HTTP-ответ, обязано быть JSON-safe: буферы и
+    // BigInteger в описании — это молчаливая порча ответа.
+    const info = describeMedia({
+        className: "MessageMediaDocument",
+        document: {
+            className: "Document",
+            mimeType: "audio/ogg",
+            size: 4096,
+            thumbs: [{ className: "PhotoStrippedSize", type: "i", bytes: Buffer.from([1, 2]) }],
+            attributes: [{ className: "DocumentAttributeAudio", voice: true, duration: 1, waveform: Buffer.from([255, 255, 255, 255, 255]) }],
+        },
+    });
+    const restored = JSON.parse(JSON.stringify(info));
+    assert.deepEqual(restored.waveform, new Array(8).fill(31));
+    assert.equal(typeof restored.stripped, "string");
+});
+
+// ── сообщение: привязка к чату, альбомы, пересылка ────────────────────────────
+
+test("messages: chatId маркирован и не пуст даже без peerId", () => {
+    // Привязка сообщения к чату — главная ловушка контракта: peerId
+    // маркирован, fromId нет. chatId закрывает её на сервере, чтобы клиенту
+    // не приходилось угадывать по форме числа.
+    const inChannel = normalizeMessage({
+        id: 1,
+        peerId: new Api.PeerChannel({ channelId: 1500000001 }),
+        fromId: new Api.PeerUser({ userId: 7 }),
+    });
+    assert.equal(inChannel.chatId, "-1001500000001");
+
+    // Личка без peerId: у входящего чат — это отправитель.
+    const incoming = normalizeMessage({
+        id: 2,
+        out: false,
+        fromId: new Api.PeerUser({ userId: 7 }),
+    });
+    assert.equal(incoming.chatId, "7");
+
+    // У исходящего без peerId опереться не на что — врать нельзя.
+    const outgoing = normalizeMessage({ id: 3, out: true });
+    assert.equal(outgoing.chatId, null);
+});
+
+test("messages: groupedId остаётся строкой — альбом теряется при округлении", () => {
+    // groupedId — long порядка 10^18: Number обрезал бы младшие цифры, и два
+    // разных альбома слились бы в один.
+    const grouped = { toString: () => "13950237418741241", isZero: () => false, add: () => grouped };
+    const msg = normalizeMessage({ id: 4, peerId: { value: 1 }, groupedId: grouped });
+    assert.equal(msg.groupedId, "13950237418741241");
+    assert.equal(normalizeMessage({ id: 5, peerId: { value: 1 } }).groupedId, null);
+});
+
+test("messages: медиа описывается прямо в сообщении", () => {
+    // Иначе клиент узнаёт о вложении только по строке mediaType и не может
+    // ни нарисовать заглушку, ни решить, качать ли файл.
+    const msg = normalizeMessage({
+        id: 6,
+        peerId: { value: 1 },
+        media: {
+            className: "MessageMediaPhoto",
+            photo: { className: "Photo", sizes: [{ className: "PhotoSize", type: "x", w: 800, h: 600, size: 50000 }] },
+        },
+    });
+    assert.equal(msg.mediaType, "MessageMediaPhoto");
+    assert.equal(msg.media.kind, "photo");
+    assert.equal(msg.media.width, 800);
+    assert.equal(normalizeMessage({ id: 7, peerId: { value: 1 } }).media, null);
+});
+
+test("messages: пересылка отдаёт источник, а скрытый — только имя", () => {
+    const msg = normalizeMessage({
+        id: 8,
+        peerId: { value: 1 },
+        fwdFrom: {
+            className: "MessageFwdHeader",
+            fromId: new Api.PeerChannel({ channelId: 1500000001 }),
+            date: 1700000000,
+            channelPost: 42,
+            postAuthor: "Автор",
+        },
+    });
+    assert.equal(msg.fwdFrom.fromId, "-1001500000001");
+    assert.equal(msg.fwdFrom.channelPost, 42);
+    assert.equal(msg.fwdFrom.postAuthor, "Автор");
+    assert.ok(msg.fwdFrom.date > 1_000_000_000_000, "дата пересылки в миллисекундах");
+
+    // У пользователя, закрывшего ссылку на свой профиль, есть только имя.
+    const hidden = normalizeMessage({
+        id: 9,
+        peerId: { value: 1 },
+        fwdFrom: { className: "MessageFwdHeader", fromName: "Аноним", date: 1700000000 },
+    });
+    assert.equal(hidden.fwdFrom.fromId, null);
+    assert.equal(hidden.fwdFrom.fromName, "Аноним");
+    assert.equal(normalizeMessage({ id: 10, peerId: { value: 1 } }).fwdFrom, null);
+});
+
+test("messages: viaBotId доезжает строкой", () => {
+    const msg = normalizeMessage({ id: 11, peerId: { value: 1 }, viaBotId: 123456789n });
+    assert.equal(msg.viaBotId, "123456789");
+    assert.equal(normalizeMessage({ id: 12, peerId: { value: 1 } }).viaBotId, null);
+});
+
+test("messages: senderName берётся из сущности, а у канала — из подписи", () => {
+    // В группе рядом с пузырём нужно имя, а не идентификатор. Сущность уже
+    // разрешена внутри getMessages — второй запрос за ней был бы лишним.
+    const user = normalizeMessage({
+        id: 13,
+        peerId: { value: 1 },
+        sender: { className: "User", firstName: "Иван", lastName: "Петров" },
+    });
+    assert.equal(user.senderName, "Иван Петров");
+
+    const noName = normalizeMessage({
+        id: 14,
+        peerId: { value: 1 },
+        sender: { className: "User", username: "durov" },
+    });
+    assert.equal(noName.senderName, "durov");
+
+    const channel = normalizeMessage({
+        id: 15,
+        peerId: { value: 1 },
+        sender: { className: "Channel", title: "Канал" },
+    });
+    assert.equal(channel.senderName, "Канал");
+
+    // Подписанный пост канала: сущность — сам канал, а автор указан отдельно.
+    const signed = normalizeMessage({
+        id: 16,
+        peerId: { value: 1 },
+        post: true,
+        postAuthor: "Редактор",
+        sender: { className: "Channel", title: "Канал" },
+    });
+    assert.equal(signed.senderName, "Редактор");
+
+    assert.equal(normalizeMessage({ id: 17, peerId: { value: 1 } }).senderName, null);
+});
+
+test("listener: удаление в канале приходит маркированным", () => {
+    // План волны 5 требовал починить здесь маркировку через Api.PeerChannel.
+    // В текущем teleproto DeletedMessageEvent уже строит peer сам, и chatId
+    // выходит маркированным. Тест закрепляет это: обновление библиотеки —
+    // единственное, что может вернуть ошибку, и молча.
+    const built = new DeletedMessage({}).build(new Api.UpdateDeleteChannelMessages({
+        channelId: 1500000001,
+        messages: [10, 11],
+        pts: 1,
+        ptsCount: 2,
+    }));
+    const event = deletedMessagesEvent(built);
+    assert.equal(event.type, "deleted_messages");
+    assert.equal(event.peerId, "-1001500000001");
+    assert.deepEqual(event.deletedIds, [10, 11]);
+});
+
+test("listener: в личке чат удаления неизвестен — поле пусто, а не выдумано", () => {
+    // Telegram не сообщает чат для личек и малых групп: идентификаторы там
+    // глобально уникальны. Пустой peerId честнее подставленного наугад.
+    const built = new DeletedMessage({}).build(new Api.UpdateDeleteMessages({
+        messages: [5],
+        pts: 1,
+        ptsCount: 1,
+    }));
+    const event = deletedMessagesEvent(built);
+    assert.equal(event.peerId, "");
+    assert.deepEqual(event.deletedIds, [5]);
+});
+
+// ── диапазоны и потоковая отдача файлов ───────────────────────────────────────
+
+test("range: обычные формы заголовка", () => {
+    assert.deepEqual(parseRange("bytes=0-499", 1000), { start: 0, end: 499 });
+    // Открытый конец — до последнего байта, а не до size.
+    assert.deepEqual(parseRange("bytes=500-", 1000), { start: 500, end: 999 });
+    // Суффикс: последние N байт. Плеер спрашивает так про хвост контейнера.
+    assert.deepEqual(parseRange("bytes=-300", 1000), { start: 700, end: 999 });
+    // Конец за пределами файла подрезается, а не отвергается.
+    assert.deepEqual(parseRange("bytes=900-5000", 1000), { start: 900, end: 999 });
+});
+
+test("range: неразобранный заголовок означает «отдать целиком»", () => {
+    // Возврат null — это не ошибка, а «диапазона нет»: ответ 200 с полным
+    // телом остаётся законным для любого клиента.
+    assert.equal(parseRange(undefined, 1000), null);
+    assert.equal(parseRange("", 1000), null);
+    assert.equal(parseRange("items=0-10", 1000), null);
+    assert.equal(parseRange("bytes=abc", 1000), null);
+    // Составной диапазон отдавать multipart мы не умеем — честнее весь файл.
+    assert.equal(parseRange("bytes=0-1,5-6", 1000), null);
+    // Размер неизвестен — считать проценты не от чего.
+    assert.equal(parseRange("bytes=0-10", null), null);
+});
+
+test("range: запрос за пределами файла — 416, а не пустое тело", () => {
+    // Пустой 206 плеер трактует как конец файла и останавливает проигрывание.
+    assert.equal(parseRange("bytes=1000-", 1000), "unsatisfiable");
+    assert.equal(parseRange("bytes=5000-6000", 1000), "unsatisfiable");
+    // Нулевой суффикс тоже бессмыслен.
+    assert.equal(parseRange("bytes=-0", 1000), "unsatisfiable");
+});
+
+test("media: план загрузки выравнивает смещение, а не режет по живому", () => {
+    // upload.getFile принимает только выровненное смещение; лишние байты
+    // головы отбрасываются уже у нас.
+    assert.deepEqual(chunkPlan(0, 999), { offset: 0, skip: 0, length: 1000 });
+    assert.deepEqual(chunkPlan(5000, 5999), { offset: 4096, skip: 904, length: 1000 });
+    assert.deepEqual(chunkPlan(4096, 8191), { offset: 4096, skip: 0, length: 4096 });
+});
+
+test("media: нарезка отдаёт ровно запрошенные байты", async () => {
+    async function* source() {
+        yield Buffer.from("abcdefghij");
+        yield Buffer.from("klmnopqrst");
+    }
+    const out = [];
+    for await (const chunk of sliceChunks(source(), 3, 5)) out.push(chunk);
+    assert.equal(Buffer.concat(out).toString(), "defgh");
+
+    // Через границу чанка.
+    const across = [];
+    for await (const chunk of sliceChunks(source(), 8, 6)) across.push(chunk);
+    assert.equal(Buffer.concat(across).toString(), "ijklmn");
+
+    // Хвост короче запрошенного — отдаём что есть, без ожидания.
+    const tail = [];
+    for await (const chunk of sliceChunks(source(), 15, 999)) tail.push(chunk);
+    assert.equal(Buffer.concat(tail).toString(), "pqrst");
+});
+
+test("media: нарезка перестаёт тянуть чанки, как только набрала длину", async () => {
+    // Иначе Range на первый килобайт видео выкачал бы весь файл: клиент уже
+    // отключился, а шлюз продолжает платить за трафик.
+    let pulled = 0;
+    async function* source() {
+        for (let i = 0; i < 100; i++) { pulled++; yield Buffer.alloc(10, i); }
+    }
+    const out = [];
+    for await (const chunk of sliceChunks(source(), 0, 15)) out.push(chunk);
+    assert.equal(Buffer.concat(out).length, 15);
+    assert.equal(pulled, 2, "лишние чанки не запрашиваются");
+});
+
+test("media: на аккаунт приходится не больше двух загрузок сразу", async () => {
+    // Память шлюза — общий ресурс: без ограничения одна вкладка с десятком
+    // видео забирает её целиком у всех аккаунтов.
+    const gate = createDownloadGate(2);
+    const first = await gate.acquire("acc_a");
+    const second = await gate.acquire("acc_a");
+
+    let thirdEntered = false;
+    const third = gate.acquire("acc_a").then((release) => { thirdEntered = true; return release; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(thirdEntered, false, "третья загрузка ждёт освободившегося места");
+
+    // Другой аккаунт считается отдельно и не стоит в чужой очереди.
+    const other = await gate.acquire("acc_b");
+    other();
+
+    first();
+    (await third)();
+    second();
+    assert.equal(thirdEntered, true);
+});
+
+test("media: место освобождается даже если загрузка упала", async () => {
+    const gate = createDownloadGate(1);
+    const release = await gate.acquire("acc_a");
+    release();
+    // Повторное освобождение не должно открывать лишнее место.
+    release();
+    const again = await gate.acquire("acc_a");
+    let entered = false;
+    gate.acquire("acc_a").then(() => { entered = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(entered, false);
+    again();
+});
+
+test("media: обрезка выбирается по запрошенному размеру", () => {
+    const thumbs = [
+        { type: "s", width: 90, height: 60, size: 1500 },
+        { type: "m", width: 320, height: 213, size: 9000 },
+        { type: "x", width: 800, height: 533, size: 40000 },
+    ];
+    // «s» — самая мелкая: она нужна списку диалогов, где важен вес, а не вид.
+    assert.equal(pickThumbType(thumbs, "s"), "s");
+    // «m» — самая крупная из обрезок: пузырь в чате должен быть чётким.
+    assert.equal(pickThumbType(thumbs, "m"), "x");
+    assert.equal(pickThumbType(thumbs, "что-то"), "x");
+    assert.equal(pickThumbType([], "m"), null);
+    assert.equal(pickThumbType(undefined, "s"), null);
+});
+
+// ── загрузка медиа ────────────────────────────────────────────────────────────
+
+/**
+ * Клиент-обманка: настоящий требует живой сессии Telegram, а проверять здесь
+ * надо не MTProto, а наше обращение с ним — смещения, границы и отказы.
+ */
+function fakeClient({ message, chunkSize = 10, total = 100 }) {
+    const calls = { iterDownload: [], downloadMedia: [] };
+    return {
+        calls,
+        async getEntity() { return { className: "User", id: 1 }; },
+        async getMessages() { return message ? [message] : []; },
+        async *iterDownload(file, params) {
+            calls.iterDownload.push(params);
+            for (let sent = params.offset; sent < total; sent += chunkSize) {
+                // Байт равен своему смещению по модулю 251 — так видно, какой
+                // именно участок файла доехал до клиента.
+                const chunk = Buffer.alloc(Math.min(chunkSize, total - sent));
+                for (let i = 0; i < chunk.length; i++) chunk[i] = (sent + i) % 251;
+                yield chunk;
+            }
+        },
+        async downloadMedia(file, params) {
+            calls.downloadMedia.push(params);
+            return Buffer.from("jpeg");
+        },
+    };
+}
+
+const photoMessage = {
+    id: 5,
+    media: {
+        className: "MessageMediaPhoto",
+        photo: {
+            className: "Photo",
+            id: 777,
+            sizes: [
+                { className: "PhotoStrippedSize", type: "i", bytes: Buffer.from([1]) },
+                { className: "PhotoSize", type: "s", w: 90, h: 60, size: 20 },
+                { className: "PhotoSize", type: "x", w: 800, h: 533, size: 100 },
+            ],
+        },
+    },
+};
+
+test("media: без диапазона файл тянется с начала и целиком", async () => {
+    const client = fakeClient({ message: photoMessage });
+    const opened = await openMedia(client, "me", 5);
+    assert.equal(opened.info.size, 100);
+    assert.equal(opened.info.kind, "photo");
+    const body = [];
+    for await (const chunk of streamMedia(client, opened)) body.push(chunk);
+    assert.equal(Buffer.concat(body).length, 100);
+    assert.equal(client.calls.iterDownload[0].offset, 0);
+});
+
+test("media: диапазон просит выровненное смещение, а отдаёт запрошенное", async () => {
+    // Телеграму нельзя дать произвольное смещение, а плееру нельзя отдать
+    // лишние байты головы: он считает их частью кадра.
+    const client = fakeClient({ message: photoMessage, total: 20000 });
+    const opened = await openMedia(client, "me", 5);
+    const body = [];
+    for await (const chunk of streamMedia(client, opened, { range: { start: 5000, end: 5099 } })) body.push(chunk);
+    const bytes = Buffer.concat(body);
+    assert.equal(bytes.length, 100);
+    assert.equal(bytes[0], 5000 % 251, "первый байт — ровно запрошенный");
+    assert.equal(client.calls.iterDownload[0].offset, 4096, "смещение выровнено");
+});
+
+test("media: у сообщения без вложения качать нечего", async () => {
+    const client = fakeClient({ message: { id: 5 } });
+    await assert.rejects(() => openMedia(client, "me", 5),
+        (err) => err instanceof ProtocolError && err.code === "no_media");
+});
+
+test("media: за гео и опросом файла нет — это тоже no_media", async () => {
+    // Иначе шлюз уходит в загрузку, которой не существует, и клиент ждёт
+    // ответа до таймаута вместо честной ошибки.
+    const client = fakeClient({ message: { id: 5, media: { className: "MessageMediaGeo" } } });
+    await assert.rejects(() => openMedia(client, "me", 5),
+        (err) => err instanceof ProtocolError && err.code === "no_media");
+});
+
+test("media: пропавшее сообщение отличается от сообщения без медиа", async () => {
+    const client = fakeClient({ message: null });
+    await assert.rejects(() => openMedia(client, "me", 5),
+        (err) => err instanceof ProtocolError && err.code === "message_not_found");
+});
+
+test("media: превью качается обрезкой, а не оригиналом", async () => {
+    const client = fakeClient({ message: photoMessage });
+    const small = await downloadThumb(client, "me", 5, "s");
+    assert.equal(small.mimeType, "image/jpeg");
+    assert.equal(small.buffer.toString(), "jpeg");
+    assert.equal(small.notModified, false);
+    // Именно обрезка «s», а не самый большой размер: иначе превью весит
+    // столько же, сколько оригинал, и смысл эндпоинта теряется.
+    assert.equal(client.calls.downloadMedia[0].thumb.type, "s");
+    assert.ok(small.etag, "у превью есть ETag — иначе оно качается каждый раз");
+
+    const medium = await downloadThumb(client, "me", 5, "m");
+    assert.equal(client.calls.downloadMedia[1].thumb.type, "x");
+    assert.notEqual(small.etag, medium.etag, "ETag зависит от размера");
+});
+
+test("media: у документа без обрезок превью не выдумывается", async () => {
+    const client = fakeClient({
+        message: {
+            id: 6,
+            media: {
+                className: "MessageMediaDocument",
+                document: { className: "Document", id: 9, mimeType: "application/zip", size: 100, attributes: [] },
+            },
+        },
+    });
+    await assert.rejects(() => downloadThumb(client, "me", 6, "m"),
+        (err) => err instanceof ProtocolError && err.code === "no_thumb");
+});
+
+test("httpErrors: no_thumb — это 404, а не общая ошибка", () => {
+    // Отсутствие превью — нормальный ответ для zip-архива, и клиент должен
+    // отличать его от «сообщение не найдено», чтобы не повторять запрос.
+    const { status, body } = toHttpError(new ProtocolError("no_thumb", "У вложения нет превью."));
+    assert.equal(status, 404);
+    assert.equal(body.error, "no_thumb");
+});
+
+test("media: совпавший ETag отменяет и ответ, и саму загрузку из Telegram", () => {
+    // Иначе смысл кеша половинчатый: клиент экономит трафик до себя, а шлюз
+    // всё равно тянет обрезку из Telegram на каждый запрос списка.
+    const client = fakeClient({ message: photoMessage });
+    return downloadThumb(client, "me", 5, "s").then(async (first) => {
+        const again = await downloadThumb(client, "me", 5, "s", { ifNoneMatch: first.etag });
+        assert.equal(again.notModified, true);
+        assert.equal(again.buffer, null);
+        assert.equal(again.etag, first.etag);
+        assert.equal(client.calls.downloadMedia.length, 1, "второй загрузки не было");
+    });
+});
+
+test("range: полный файл отдаётся с 200 и объявляет поддержку диапазонов", () => {
+    // Без Accept-Ranges плеер даже не пробует перематывать — качает целиком
+    // с начала при каждом прыжке по таймлайну.
+    const head = mediaResponseHead(
+        { mimeType: "video/mp4", fileName: "клип.mp4", size: 1000 },
+        null,
+    );
+    assert.equal(head.status, 200);
+    assert.equal(head.headers["Accept-Ranges"], "bytes");
+    assert.equal(head.headers["Content-Type"], "video/mp4");
+    assert.equal(head.headers["Content-Length"], 1000);
+    // Кириллица в имени выживает только в filename* с процентным кодированием.
+    assert.match(head.headers["Content-Disposition"], /filename\*=UTF-8''%D0%BA%D0%BB%D0%B8%D0%BF\.mp4/);
+});
+
+test("range: кусок отдаётся с 206 и длиной куска, а не файла", () => {
+    // Content-Length, равный размеру файла, заставит клиента ждать байты,
+    // которых не будет, — соединение зависнет до таймаута.
+    const head = mediaResponseHead(
+        { mimeType: "video/mp4", size: 1000 },
+        { start: 200, end: 399 },
+    );
+    assert.equal(head.status, 206);
+    assert.equal(head.headers["Content-Range"], "bytes 200-399/1000");
+    assert.equal(head.headers["Content-Length"], 200);
+});
+
+test("range: запрос за пределами файла — 416 с полным размером", () => {
+    const head = mediaResponseHead({ mimeType: "video/mp4", size: 1000 }, "unsatisfiable");
+    assert.equal(head.status, 416);
+    assert.equal(head.headers["Content-Range"], "bytes */1000");
+    // Тела у 416 нет — заявлять тип нечему.
+    assert.equal(head.headers["Content-Type"], undefined);
+});
+
+test("range: неизвестный размер не превращается в нулевую длину", () => {
+    // Content-Length: 0 клиент читает как пустой файл. Лучше не объявлять его
+    // вовсе и закрыть поток концом соединения.
+    const head = mediaResponseHead({ mimeType: null, size: null }, null);
+    assert.equal(head.status, 200);
+    assert.equal(head.headers["Content-Length"], undefined);
+    assert.equal(head.headers["Content-Type"], "application/octet-stream");
+    assert.equal(head.headers["Content-Disposition"], undefined);
+});
+
+test("media: поток ленив — лишние чанки из Telegram не запрашиваются", () => {
+    // Клиент закрыл вкладку на десятой секунде видео: качать остаток значит
+    // платить каналом шлюза за то, что никто не посмотрит.
+    let produced = 0;
+    const client = {
+        async getEntity() { return {}; },
+        async getMessages() {
+            return [{ id: 1, media: { className: "MessageMediaDocument", document: { className: "Document", mimeType: "video/mp4", size: 10_000, attributes: [] } } }];
+        },
+        async *iterDownload() {
+            for (let i = 0; i < 100; i++) { produced++; yield Buffer.alloc(100); }
+        },
+    };
+
+    return openMedia(client, "me", 1).then(async (opened) => {
+        let taken = 0;
+        for await (const chunk of streamMedia(client, opened)) {
+            if (++taken === 3) break;
+        }
+        assert.equal(taken, 3);
+        assert.ok(produced <= 4, `запрошено чанков: ${produced}`);
+    });
+});
+
+test("media: память шлюза не зависит от размера файла", async () => {
+    // Главный риск волны. Старая реализация собирала файл в Buffer целиком:
+    // одно видео забирало столько RSS, сколько весило, у процесса, общего для
+    // всех аккаунтов.
+    //
+    // Проверяется именно независимость от размера, а не абсолютная цифра: RSS
+    // — отметка максимума, и освобождённые буферы возвращаются системе не
+    // сразу. Полгигабайта через поток стоят десятки мегабайт; та же выдача
+    // через Buffer стоила бы полгигабайта, и порог ниже неё на порядок.
+    const TOTAL = 512 * 1024 * 1024;
+    const CHUNK = 512 * 1024;
+    const client = {
+        async getEntity() { return {}; },
+        async getMessages() {
+            return [{ id: 1, media: { className: "MessageMediaDocument", document: { className: "Document", mimeType: "video/mp4", size: TOTAL, attributes: [] } } }];
+        },
+        async *iterDownload() {
+            for (let sent = 0; sent < TOTAL; sent += CHUNK) yield Buffer.alloc(CHUNK);
+        },
+    };
+
+    const opened = await openMedia(client, "me", 1);
+    const before = process.memoryUsage().rss;
+    let bytes = 0;
+    for await (const chunk of streamMedia(client, opened)) {
+        // Потребитель ведёт себя как сокет: взял кусок и забыл о нём.
+        bytes += chunk.length;
+    }
+    const grew = process.memoryUsage().rss - before;
+
+    assert.equal(bytes, TOTAL);
+    assert.ok(
+        grew < TOTAL / 2,
+        `RSS вырос на ${Math.round(grew / 1048576)} МБ при файле ${TOTAL / 1048576} МБ`,
+    );
+});
+
+// ── прокси: разбор PROXY_URL ──────────────────────────────────────────────────
+
+test("proxy: socks5 с авторизацией разбирается целиком", () => {
+    const proxy = parseProxyUrl("socks5://user:pass@1.2.3.4:1080");
+    assert.equal(proxy.kind, "socks");
+    assert.equal(proxy.socksType, 5);
+    assert.equal(proxy.host, "1.2.3.4");
+    assert.equal(proxy.port, 1080);
+    assert.equal(proxy.username, "user");
+    assert.equal(proxy.password, "pass");
+});
+
+test("proxy: без порта и без авторизации подставляются умолчания", () => {
+    assert.equal(parseProxyUrl("socks5://1.2.3.4").port, 1080);
+    assert.equal(parseProxyUrl("http://1.2.3.4").port, 80);
+    assert.equal(parseProxyUrl("https://1.2.3.4").port, 443);
+    // Пустая строка, а не undefined: «авторизации нет».
+    assert.equal(parseProxyUrl("http://1.2.3.4").username, "");
+    assert.equal(parseProxyUrl("http://1.2.3.4").password, "");
+});
+
+test("proxy: socks4 и псевдонимы из мира curl", () => {
+    assert.equal(parseProxyUrl("socks4://h").socksType, 4);
+    assert.equal(parseProxyUrl("socks4a://h").socksType, 4);
+    assert.equal(parseProxyUrl("socks5h://h").socksType, 5);
+    assert.equal(parseProxyUrl("socks://h").socksType, 5);
+});
+
+test("proxy: http и https различаются только TLS до прокси", () => {
+    assert.equal(parseProxyUrl("http://127.0.0.1:3128").kind, "http");
+    assert.equal(parseProxyUrl("http://127.0.0.1:3128").tls, false);
+    assert.equal(parseProxyUrl("https://127.0.0.1:8443").tls, true);
+    assert.equal(parseProxyUrl("https://127.0.0.1:8443").insecureTls, false);
+    assert.equal(parseProxyUrl("https://127.0.0.1:8443?insecure=1").insecureTls, true);
+});
+
+test("proxy: спецсимволы в логине и пароле берутся из percent-encoding", () => {
+    const proxy = parseProxyUrl("http://us%40er:p%40ss%3Aw@h:3128");
+    assert.equal(proxy.username, "us@er");
+    assert.equal(proxy.password, "p@ss:w");
+});
+
+test("proxy: одиночный % даёт понятную ошибку, а не «malformed URI»", () => {
+    assert.throws(() => parseProxyUrl("http://u:p%@h"), /percent-encoding/);
+});
+
+test("proxy: пусто — прямое подключение", () => {
+    assert.equal(parseProxyUrl(""), null);
+    assert.equal(parseProxyUrl("   "), null);
+    assert.equal(parseProxyUrl(undefined), null);
+});
+
+test("proxy: мусор в PROXY_URL роняет старт, а не откатывается на прямое соединение", () => {
+    assert.throws(() => parseProxyUrl("ftp://h:21"), /не поддерживается/);
+    assert.throws(() => parseProxyUrl("127.0.0.1:1080"), /не похоже на URL/);
+    // Порт вне диапазона отвергает сам разбор URL — до наших проверок не доходит.
+    assert.throws(() => parseProxyUrl("socks5://h:99999"), /не похоже на URL/);
+});
+
+test("proxy: IPv6-хост отдаётся без квадратных скобок", () => {
+    // net.connect ждёт голый адрес, а WHATWG-URL оставляет скобки.
+    assert.equal(parseProxyUrl("socks5://[::1]:1080").host, "::1");
+});
+
+test("proxy: PROXY_TIMEOUT — значение, умолчание и мусор", () => {
+    assert.equal(parseProxyUrl("socks5://h", 12).timeout, 12);
+    assert.equal(parseProxyUrl("socks5://h").timeout, 5);
+    assert.equal(parseProxyUrl("socks5://h", NaN).timeout, 5);
+    assert.equal(parseProxyUrl("socks5://h", 0).timeout, 5);
+    assert.equal(parseProxyUrl("socks5://h", -1).timeout, 5);
+});
+
+test("proxy: секрет mtproxy читается из userinfo и из ?secret=", () => {
+    const hex = "ab".repeat(16);
+    assert.equal(parseProxyUrl(`mtproxy://${hex}@1.2.3.4:443`).secret, hex);
+    assert.equal(parseProxyUrl(`mtproxy://1.2.3.4:443?secret=${hex}`).secret, hex);
+    assert.equal(parseProxyUrl(`mtproxy://${hex}@1.2.3.4:443`).kind, "mtproxy");
+});
+
+test("proxy: длина секрета mtproxy проверяется до первого соединения", () => {
+    // dd-секрет с паддингом и ee-секрет с доменом (fake-TLS, base64url из tg://proxy).
+    assert.ok(parseProxyUrl(`mtproxy://dd${"00".repeat(16)}@h`).secret);
+    const fakeTls = Buffer.concat([Buffer.from([0xee]), Buffer.alloc(16, 1), Buffer.from("google.com")]);
+    assert.ok(parseProxyUrl(`mtproxy://h?secret=${fakeTls.toString("base64url")}`).secret);
+    assert.throws(() => parseProxyUrl("mtproxy://abcd@h"), /Ожидается 16/);
+    assert.throws(() => parseProxyUrl("mtproxy://h"), /нужен секрет/);
+});
+
+test("proxy: describeProxy не печатает пароль и секрет", () => {
+    const shown = describeProxy(parseProxyUrl("http://user:s3cret@h:3128"));
+    assert.ok(!shown.includes("s3cret"), shown);
+    assert.match(shown, /user:\*\*\*@h:3128/);
+    // Без авторизации это должно быть видно сразу, а не угадываться.
+    assert.match(describeProxy(parseProxyUrl("http://h:3128")), /без авторизации/);
+
+    const hex = "ab".repeat(16);
+    const mt = describeProxy(parseProxyUrl(`mtproxy://${hex}@h`));
+    assert.ok(!mt.includes(hex), mt);
+    assert.equal(describeProxy(null), "выключен");
+});
+
+// ── прокси: выбор источника настроек ──────────────────────────────────────────
+
+test("proxy: PROXY_URL важнее системных переменных", () => {
+    const picked = pickProxySource({ PROXY_URL: "socks5://explicit", ALL_PROXY: "http://system" }, true);
+    assert.deepEqual(picked, { name: "PROXY_URL", value: "socks5://explicit" });
+});
+
+test("proxy: без PROXY_FROM_ENV системные переменные не читаются", () => {
+    // Иначе прокси, выставленный в шелле для совсем других задач, молча увёл бы
+    // боевые сессии Telegram.
+    assert.deepEqual(pickProxySource({ ALL_PROXY: "http://system" }, false), { name: "", value: "" });
+    assert.deepEqual(pickProxySource({}, true), { name: "", value: "" });
+});
+
+test("proxy: приоритет системных переменных — HTTPS_PROXY, затем ALL_PROXY, затем HTTP_PROXY", () => {
+    const all = { HTTPS_PROXY: "http://a", ALL_PROXY: "socks5://b", HTTP_PROXY: "http://c" };
+    assert.equal(pickProxySource(all, true).name, "HTTPS_PROXY");
+    assert.equal(pickProxySource({ ALL_PROXY: "socks5://b", HTTP_PROXY: "http://c" }, true).name, "ALL_PROXY");
+    assert.equal(pickProxySource({ HTTP_PROXY: "http://c" }, true).name, "HTTP_PROXY");
+});
+
+test("proxy: строчные имена переменных идут первыми", () => {
+    // На Unix они встречаются чаще; так же их предпочитает curl.
+    assert.equal(pickProxySource({ https_proxy: "http://a", HTTPS_PROXY: "http://b" }, true).name, "https_proxy");
+    assert.equal(pickProxySource({ all_proxy: "socks5://a" }, true).value, "socks5://a");
+});
+
+test("proxy: пустые и пробельные значения переменных пропускаются", () => {
+    assert.equal(pickProxySource({ PROXY_URL: "   ", ALL_PROXY: "socks5://b" }, true).name, "ALL_PROXY");
+    assert.equal(pickProxySource({ HTTPS_PROXY: "", ALL_PROXY: "socks5://b" }, true).name, "ALL_PROXY");
+});
+
+test("proxy: в тексте ошибки названа та переменная, где лежит мусор", () => {
+    // Жалоба на PROXY_URL при значении из ALL_PROXY отправила бы искать не там.
+    assert.throws(() => parseProxyUrl("ftp://h", 5, "ALL_PROXY"), /^Error: ALL_PROXY: схема/);
+    assert.throws(() => parseProxyUrl("ftp://h"), /^Error: PROXY_URL: схема/);
+});
+
+// ── прокси: рукопожатие CONNECT ───────────────────────────────────────────────
+
+/** Читатель поверх буфера: считает, сколько байт реально съедено. */
+function fakeReader(buffer) {
+    let offset = 0;
+    return {
+        async readExactly(n) {
+            if (offset + n > buffer.length) throw new Error("NetSocket was closed");
+            const out = buffer.subarray(offset, offset + n);
+            offset += n;
+            return out;
+        },
+        get consumed() { return offset; },
+    };
+}
+
+test("proxy: CONNECT без авторизации не отправляет Proxy-Authorization", () => {
+    const request = buildConnectRequest({ host: "149.154.167.51", port: 443 }).toString();
+    assert.match(request, /^CONNECT 149\.154\.167\.51:443 HTTP\/1\.1\r\n/);
+    assert.match(request, /\r\nHost: 149\.154\.167\.51:443\r\n/);
+    assert.ok(!request.includes("Proxy-Authorization"), request);
+    assert.ok(request.endsWith("\r\n\r\n"));
+});
+
+test("proxy: CONNECT с авторизацией шлёт Basic сразу, не дожидаясь 407", () => {
+    const request = buildConnectRequest({ host: "h", port: 443, username: "user", password: "pass" }).toString();
+    const token = Buffer.from("user:pass", "utf8").toString("base64");
+    assert.match(request, new RegExp(`\r\nProxy-Authorization: Basic ${token}\r\n`));
+});
+
+test("proxy: IPv6-цель в CONNECT берётся в квадратные скобки", () => {
+    const request = buildConnectRequest({ host: "2001:db8::1", port: 443 }).toString();
+    assert.match(request, /^CONNECT \[2001:db8::1\]:443 HTTP\/1\.1\r\n/);
+});
+
+test("proxy: успешный ответ разбирается в обеих версиях HTTP", () => {
+    assert.deepEqual(
+        parseConnectResponse(Buffer.from("HTTP/1.0 200 Connection established\r\n\r\n")),
+        { code: 200, reason: "Connection established" },
+    );
+    assert.deepEqual(parseConnectResponse(Buffer.from("HTTP/1.1 200 OK\r\n\r\n")), { code: 200, reason: "OK" });
+});
+
+test("proxy: 407 и 403 разбираются с кодом и причиной", () => {
+    assert.equal(parseConnectResponse(Buffer.from("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")).code, 407);
+    assert.equal(parseConnectResponse(Buffer.from("HTTP/1.1 403 Forbidden\r\n\r\n")).reason, "Forbidden");
+});
+
+test("proxy: ответ не по HTTP — понятная ошибка, а не разбор мусора", () => {
+    // Так выглядит начало ответа SOCKS5, если схему в PROXY_URL перепутали.
+    assert.throws(
+        () => parseConnectResponse(Buffer.from([0x05, 0x00, 0x00, 0x01])),
+        (err) => err.code === "proxy_protocol_error",
+    );
+});
+
+test("proxy: байты MTProto, приклеенные к ответу прокси, не теряются", async () => {
+    const header = "HTTP/1.1 200 OK\r\n\r\n";
+    const tail = Buffer.from([0xef, 0x01, 0x02, 0x03]);
+    const reader = fakeReader(Buffer.concat([Buffer.from(header), tail]));
+
+    const read = await readConnectResponse(reader);
+    assert.equal(read.toString(), header);
+    // Ни одного лишнего байта: хвост достанется первому же чтению кодека.
+    assert.equal(reader.consumed, header.length);
+    assert.deepEqual(await reader.readExactly(4), tail);
+});
+
+test("proxy: многострочный заголовок ответа читается целиком", async () => {
+    const header = "HTTP/1.1 200 OK\r\nProxy-Agent: tinyproxy\r\nVia: 1.1 proxy\r\n\r\n";
+    const read = await readConnectResponse(fakeReader(Buffer.from(header)));
+    assert.equal(read.toString(), header);
+});
+
+test("proxy: бесконечный заголовок обрывается лимитом", async () => {
+    await assert.rejects(
+        () => readConnectResponse(fakeReader(Buffer.alloc(100, 0x41)), 32),
+        /за 32 байт/,
+    );
+});
+
+// ── прокси: выбор транспорта ──────────────────────────────────────────────────
+
+test("proxy: socks уходит в штатную опцию teleproto", () => {
+    const options = proxyClientOptions(parseProxyUrl("socks5://user:pass@h:1080"));
+    assert.equal(options.proxy.socksType, 5);
+    assert.equal(options.proxy.ip, "h");
+    assert.equal(options.proxy.username, "user");
+    assert.equal(options.networkSocket, undefined);
+});
+
+test("proxy: socks без авторизации не шлёт пустые учётные данные", () => {
+    // Пустая строка включила бы в SOCKS5 аутентификацию, и прокси без неё откажет.
+    const options = proxyClientOptions(parseProxyUrl("socks5://h:1080"));
+    assert.equal(options.proxy.username, undefined);
+    assert.equal(options.proxy.password, undefined);
+});
+
+test("proxy: mtproxy включает собственную ветку teleproto", () => {
+    const hex = "ab".repeat(16);
+    const options = proxyClientOptions(parseProxyUrl(`mtproxy://${hex}@h:443`));
+    assert.equal(options.proxy.MTProxy, true);
+    assert.equal(options.proxy.secret, hex);
+    assert.equal(options.networkSocket, undefined);
+});
+
+test("proxy: http подменяет транспорт и не отдаёт teleproto чужой прокси", () => {
+    const options = proxyClientOptions(parseProxyUrl("http://h:3128"));
+    // Опция proxy обязана отсутствовать: PromisedNetSockets на ней бросит.
+    assert.equal(options.proxy, undefined);
+    assert.equal(typeof options.networkSocket, "function");
+    const socket = new options.networkSocket(undefined, 30000);
+    assert.ok(socket instanceof PromisedNetSockets);
+    // isWebSocket подменил бы соединение на ConnectionTCPObfuscated и адреса DC.
+    assert.equal(options.networkSocket.isWebSocket, undefined);
+});
+
+test("proxy: без настроек опции клиента не меняются", () => {
+    assert.deepEqual(proxyClientOptions(null), {});
+});
+
+test("proxy: ошибки прокси отдаются как 502/504, а не 500", () => {
+    assert.equal(toHttpError(new ProtocolError("proxy_unreachable", "нет связи")).status, 502);
+    assert.equal(toHttpError(new ProtocolError("proxy_auth_required", "407")).status, 502);
+    assert.equal(toHttpError(new ProtocolError("proxy_timeout", "молчит")).status, 504);
+});
+
+// ── прокси: сквозное рукопожатие через локальный прокси ───────────────────────
+
+/**
+ * Поднимает фейковый CONNECT-прокси на localhost.
+ * @param {(request: string, socket: import("node:net").Socket) => void} onConnect
+ */
+async function fakeProxy(onConnect) {
+    const server = net.createServer((socket) => {
+        socket.once("data", (chunk) => onConnect(chunk.toString(), socket));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return { port: server.address().port, close: () => new Promise((r) => server.close(r)) };
+}
+
+test("proxy: сквозной CONNECT отдаёт полезную нагрузку из того же пакета", async () => {
+    const payload = Buffer.from([0xef, 0x01, 0x02, 0x03]);
+    let seen = "";
+    const proxy = await fakeProxy((request, socket) => {
+        seen = request;
+        // Ответ и первые байты MTProto одним write — так и ведёт себя реальный прокси.
+        socket.write(Buffer.concat([Buffer.from("HTTP/1.1 200 Connection established\r\n\r\n"), payload]));
+    });
+
+    const Socket = createProxySocketFactory(parseProxyUrl(`http://127.0.0.1:${proxy.port}`));
+    const socket = new Socket(undefined, 30000);
+    try {
+        await socket.connect(443, "149.154.167.51");
+        assert.match(seen, /^CONNECT 149\.154\.167\.51:443 HTTP\/1\.1\r\n/);
+        assert.deepEqual(await socket.readExactly(4), payload);
+    } finally {
+        await socket.close();
+        await proxy.close();
+    }
+});
+
+test("proxy: 407 от прокси превращается в proxy_auth_required", async () => {
+    const proxy = await fakeProxy((_request, socket) => {
+        socket.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n");
+    });
+
+    const Socket = createProxySocketFactory(parseProxyUrl(`http://127.0.0.1:${proxy.port}`));
+    const socket = new Socket(undefined, 30000);
+    try {
+        await assert.rejects(
+            () => socket.connect(443, "149.154.167.51"),
+            (err) => err.code === "proxy_auth_required" && /Добавьте учётные данные/.test(err.hint),
+        );
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("proxy: недоступный прокси — proxy_unreachable, а не зависание", async () => {
+    // Порт, который заведомо никто не слушает: поднимаем и сразу закрываем.
+    const dead = await fakeProxy(() => {});
+    const port = dead.port;
+    await dead.close();
+
+    const Socket = createProxySocketFactory(parseProxyUrl(`http://127.0.0.1:${port}`));
+    const socket = new Socket(undefined, 30000);
+    await assert.rejects(
+        () => socket.connect(443, "149.154.167.51"),
+        (err) => err.code === "proxy_unreachable",
     );
 });

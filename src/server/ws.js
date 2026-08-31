@@ -2,6 +2,8 @@ import { WebSocketServer } from "ws";
 import { getAccount } from "./accounts.js";
 import { sessionManager } from "../telegram/sessionManager.js";
 import { stringify } from "../telegram/serialize.js";
+import { isOriginAllowed } from "./cors.js";
+import { config } from "../config.js";
 
 /** Интервал keepalive-пинга, мс. */
 const PING_INTERVAL_MS = 30_000;
@@ -19,6 +21,17 @@ export function attachWs(httpServer) {
         socket.isAlive = true;
         socket.on("pong", () => { socket.isAlive = true; });
         socket.on("error", () => {});
+
+        // CORS на WebSocket не распространяется: браузер выполняет рукопожатие
+        // без предварительного запроса и отдаёт соединение странице, даже если
+        // источник чужой. Поэтому Origin проверяется здесь вручную — иначе
+        // любой открытый пользователем сайт смог бы подключиться к шлюзу.
+        // Не-браузерные клиенты Origin не присылают и проверку не проходят зря.
+        const origin = req.headers.origin;
+        if (origin && !isOriginAllowed(origin, config.corsOrigins)) {
+            socket.close(4001, "origin_not_allowed");
+            return;
+        }
 
         const url = new URL(req.url, "http://localhost");
         const token = url.searchParams.get("token") || "";

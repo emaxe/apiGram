@@ -22,6 +22,8 @@ application talks to it over plain HTTP and receives a realtime stream over WebS
 - [Endpoints](#endpoints)
 - [WebSocket](#websocket)
 - [Errors](#errors)
+- [Browser clients](#browser-clients)
+- [Proxy](#proxy)
 - [Security](#security)
 - [Limitations](#limitations)
 - [Tests](#tests)
@@ -87,6 +89,10 @@ The address used by `start` / `health` / `smoke` is read from `.env` rather than
 | `DATA_DIR` | `./data` | account registry and updates log (mode `0600`) |
 | `LOG_UPDATES` | `false` | write the update stream to `data/updates.jsonl` |
 | `UPDATES_MAX_MB` | `50` | log rotation threshold |
+| `CORS_ORIGINS` | empty | origins allowed to make browser requests (comma-separated); empty = CORS disabled |
+| `PROXY_URL` | empty | proxy for the MTProto connection: `socks5://`, `socks4://`, `http://`, `https://`, `mtproxy://`; empty = direct connection |
+| `PROXY_TIMEOUT` | `5` | proxy connection timeout, seconds |
+| `PROXY_FROM_ENV` | `false` | when `PROXY_URL` is empty, take the proxy from `https_proxy` → `all_proxy` → `http_proxy` (either case) |
 
 ## Quick start
 
@@ -151,7 +157,8 @@ DELETE /v1/accounts/:id/chat/:peer/messages?ids=1,2&revoke=true
 POST   /v1/accounts/:id/chat/:peer/messages/:msgId/react   { emoji }
 POST   /v1/accounts/:id/chat/:peer/read               { maxId }
 POST   /v1/accounts/:id/chat/:peer/forward            { ids, fromPeer }
-GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    download media
+GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    download media (Range)
+GET    /v1/accounts/:id/chat/:peer/messages/:msgId/thumb?size=s|m   thumbnail (ETag)
 ```
 
 `:peer` is `@username`, `username`, a numeric ID (`-1001234567890`) or `me`.
@@ -174,7 +181,8 @@ Events (`JSON`, every one carries `accountEvent: true`):
 | `new_message` / `edited_message` | `message` — normalized message |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |
-| `read_inbox` | `peerId`, `maxId` |
+| `read_inbox` | `peerId`, `maxId` — we read the peer's messages |
+| `read_outbox` | `peerId`, `maxId` — the peer read our messages |
 | `session_closed` | `reason` — logged out, the socket closes with code `4003` |
 | `error` | `error` — session unavailable, the socket closes with code `4002` |
 
@@ -193,6 +201,60 @@ Close codes: `4001` — bad token or the account is not authorized,
 | 404 | chat, message or media not found |
 | 409 | the account is not authorized, or the session was revoked |
 | 429 | `flood_wait`, `seconds` says how long to wait |
+| 502 | the proxy refused or dropped the tunnel (`proxy_unreachable`, `proxy_auth_required`, `proxy_forbidden`, `proxy_connect_failed`, `proxy_protocol_error`) |
+| 504 | `proxy_timeout` — the proxy did not answer within `PROXY_TIMEOUT` |
+
+## Browser clients
+
+CORS is disabled by default, so no web page can reach the gateway. That default is
+deliberate: the gateway holds live Telegram sessions.
+
+To allow a web client, list the origins:
+
+```bash
+CORS_ORIGINS=http://127.0.0.1:8080
+```
+
+A list, not `*`. With an empty `ADMIN_TOKEN` the `POST /v1/accounts` endpoint is
+open, so a wildcard would let any page the user visits create accounts on their
+local gateway. `*` is supported but warns on startup.
+
+The `Origin` check also covers WebSocket: CORS rules do not apply to the handshake,
+so the origin is verified manually. Clients that send no `Origin` (`curl`, mobile
+and desktop builds, `scripts/smoke.mjs`) are unaffected.
+
+## Proxy
+
+MTProto can be routed through a proxy. One variable covers every scheme; authentication is
+optional everywhere, and special characters in the password are percent-encoded
+(`@` → `%40`, `:` → `%3A`):
+
+```bash
+PROXY_URL=socks5://user:pass@127.0.0.1:1080   # also socks4://
+PROXY_URL=http://user:pass@127.0.0.1:3128     # HTTP CONNECT
+PROXY_URL=https://127.0.0.1:8443              # the same, TLS to the proxy itself
+PROXY_URL=mtproxy://<secret>@1.2.3.4:443      # Telegram's own proxy (or ?secret=…)
+PROXY_TIMEOUT=5                               # connection timeout, seconds
+```
+
+`socks4`/`socks5` and `mtproxy` use teleproto's own transport. `http`/`https` are implemented
+here — the library supports neither — as a `CONNECT` tunnel over `node:net` / `node:tls`, with
+no extra dependency. A self-signed proxy certificate is accepted only with an explicit
+`https://host:8443?insecure=1`.
+
+The proxy is global: every account shares it, and media downloads from other data centres go
+through it too. A malformed value aborts startup rather than silently falling back to a direct
+connection, which would leak the real IP. Passwords and MTProxy secrets never reach the log.
+
+The system `https_proxy` / `all_proxy` / `http_proxy` variables are read only with
+`PROXY_FROM_ENV=true`, in that order and in either case; `PROXY_URL` always wins. They are
+opt-in because such variables are routinely set in a shell for unrelated tasks, and a gateway
+holding live Telegram sessions must not follow them silently. The startup line names the
+variable the settings came from:
+
+```
+apiGram proxy: socks5://10.0.0.9:1080 (without auth) (from all_proxy, timeout 5 s)
+```
 
 ## Security
 
@@ -206,14 +268,25 @@ Close codes: `4001` — bad token or the account is not authorized,
   recoverable — a lost token means deleting and recreating the account.
 - **`LOG_UPDATES=true` writes message text to disk** (`data/updates.jsonl`). It is off by
   default; keep it that way unless you actually need the audit trail.
-- **No TLS, no CORS.** Put the gateway behind a reverse proxy before exposing it.
+- **No TLS.** Put the gateway behind a reverse proxy before exposing it.
+  CORS exists but is disabled by default — see "Browser clients".
 
 ## Limitations
 
 - Sessions are stored as a `StringSession` with no entity cache: after a restart, addressing a
   chat by numeric ID may return `peer_not_found` — call `GET /dialogs` first to warm the cache.
 - Registering new phone numbers, calls, secret chats and email login are not supported.
-- CORS is not configured: a browser client needs a proxy.
+- The proxy is global: all accounts share the same connection, there is no per-account setting.
+- The system `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY` variables are ignored unless
+  `PROXY_FROM_ENV=true`. They are often set in a shell for unrelated tasks, and live Telegram
+  sessions should not follow them silently; `PROXY_URL` always wins. The startup line names the
+  variable the settings came from.
+- An HTTP proxy must support `CONNECT`; proxies that only allow it on port 443 answer with
+  `proxy_forbidden`. Proxy errors surface as `502` (`504` on timeout).
+- `mtproxy://` has no connection timeout of its own: teleproto ignores `PROXY_TIMEOUT` on that path,
+  so a dead MTProxy stalls until the OS timeout (~75 s).
+- CORS is off by default: a browser client cannot reach the gateway until its origin is
+  listed in `CORS_ORIGINS` — see "Browser clients".
 
 ## Tests
 

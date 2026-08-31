@@ -2,6 +2,7 @@ import { Api, errors } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads.js";
 import { resolveEntity, toMarkedId } from "./entities.js";
 import { idToString } from "./serialize.js";
+import { describeMedia, chunkPlan, sliceChunks, pickThumbType, rawMediaSizes } from "./media.js";
 import { ProtocolError } from "./errors.js";
 
 const { FloodWaitError } = errors;
@@ -28,7 +29,13 @@ export function normalizeMessage(message) {
         pinned: Boolean(message.pinned),
         views: message.views || null,
         forwards: message.forwards || null,
+        chatId: messageChatId(message),
+        groupedId: idToString(message.groupedId),
         mediaType: message.media?.className || null,
+        media: describeMedia(message.media),
+        fwdFrom: normalizeFwdFrom(message.fwdFrom),
+        viaBotId: idToString(message.viaBotId),
+        senderName: senderNameOf(message),
         entities: normalizeEntities(message.entities),
         reactions: Array.isArray(message.reactions?.results)
             ? message.reactions.results.map((r) => ({
@@ -38,6 +45,68 @@ export function normalizeMessage(message) {
               }))
             : [],
     };
+}
+
+/**
+ * Единственная честная привязка сообщения к чату.
+ *
+ * `peerId` маркирован, `fromId` — нет, и клиент, разбирая их сам, вынужден
+ * угадывать тип чата по форме числа. Здесь ответ считается один раз и всегда
+ * маркированным.
+ *
+ * @param {object} message
+ * @returns {string|null}
+ */
+function messageChatId(message) {
+    const peer = toMarkedId(message.peerId);
+    if (peer) return peer;
+    // Пустой peerId бывает только в личке. У входящего чат — это отправитель;
+    // у исходящего опереться не на что, и выдумывать чат нельзя.
+    if (!message.out && message.fromId) return toMarkedId(message.fromId) || null;
+    return null;
+}
+
+/**
+ * Заголовок пересылки. У отправителя, закрывшего ссылку на свой профиль,
+ * остаётся только `fromName` — по нему нельзя перейти в чат, но подписать
+ * пузырь надо всё равно.
+ * @param {object} [fwdFrom]
+ * @returns {object|null}
+ */
+function normalizeFwdFrom(fwdFrom) {
+    if (!fwdFrom) return null;
+    return {
+        fromId: fwdFrom.fromId ? toMarkedId(fwdFrom.fromId) || null : null,
+        fromName: fwdFrom.fromName || null,
+        date: fwdFrom.date ? fwdFrom.date * 1000 : null,
+        channelPost: fwdFrom.channelPost || null,
+        postAuthor: fwdFrom.postAuthor || null,
+        savedFromPeer: fwdFrom.savedFromPeer ? toMarkedId(fwdFrom.savedFromPeer) || null : null,
+        savedFromMsgId: fwdFrom.savedFromMsgId || null,
+        imported: Boolean(fwdFrom.imported),
+    };
+}
+
+/**
+ * Имя отправителя для подписи пузыря.
+ *
+ * Сущность уже разрешена внутри `getMessages`, поэтому берётся из сообщения:
+ * отдельный запрос за именем к каждому сообщению превратил бы страницу
+ * истории в сотню обращений к Telegram.
+ *
+ * @param {object} message
+ * @returns {string|null}
+ */
+function senderNameOf(message) {
+    // У подписанного поста канала сущность — сам канал, а человек указан
+    // отдельным полем: показывать надо его.
+    if (message.postAuthor) return message.postAuthor;
+    const sender = message.sender;
+    if (!sender) return null;
+    if (sender.title) return sender.title;
+    const name = [sender.firstName, sender.lastName].filter(Boolean).join(" ").trim();
+    if (name) return name;
+    return sender.username || null;
 }
 
 /**
@@ -165,39 +234,6 @@ export async function sendFiles(client, rawPeer, files, { caption = "", replyTo,
 }
 
 /**
- * Скачивание медиа сообщения. Нормализованное сообщение не хранит сырое медиа,
- * поэтому сначала дотягиваем полный объект через getMessages, затем качаем.
- * @param {import("teleproto").TelegramClient} client
- * @param {string} rawPeer
- * @param {number} messageId
- * @returns {Promise<Buffer>}
- */
-export async function downloadMedia(client, rawPeer, messageId) {
-    const entity = await resolveEntity(client, rawPeer);
-    const [raw] = await client.getMessages(entity, { ids: [messageId] });
-    if (!raw) throw new ProtocolError("message_not_found", "Сообщение не найдено.");
-    if (!raw.media) throw new ProtocolError("no_media", "У сообщения нет медиа.");
-    const buffer = await client.downloadMedia(raw.media);
-    return {
-        buffer: Buffer.from(buffer || []),
-        fileName: mediaFileName(raw.media),
-        mimeType: raw.media.document?.mimeType || null,
-    };
-}
-
-/**
- * Достаёт имя файла из атрибутов документа, если оно есть.
- * @param {object} media
- * @returns {string|null}
- */
-function mediaFileName(media) {
-    const attributes = media?.document?.attributes;
-    if (!Array.isArray(attributes)) return null;
-    const named = attributes.find((a) => a.className === "DocumentAttributeFilename");
-    return named?.fileName || null;
-}
-
-/**
  * Отправка реакции.
  * @param {import("teleproto").TelegramClient} client
  * @param {string} rawPeer
@@ -238,4 +274,99 @@ export async function forwardMessages(client, toPeer, ids, { fromPeer } = {}) {
     if (fromPeer) params.fromPeer = await resolveEntity(client, fromPeer);
     const sent = await client.forwardMessages(entity, params);
     return (Array.isArray(sent) ? sent : [sent]).filter(Boolean).map(normalizeMessage);
+}
+/**
+ * Достаёт сообщение вместе с описанием его вложения.
+ *
+ * Отдельный шаг от самой загрузки: HTTP-слою нужен размер файла раньше, чем
+ * первый байт — без него не разобрать `Range` и не выставить `Content-Length`.
+ *
+ * Проверяется не только наличие медиа, но и то, что за ним стоит файл: у гео,
+ * опроса и контакта вложения нет, и уход в загрузку заканчивался бы ожиданием
+ * до таймаута вместо честной ошибки.
+ *
+ * @param {import("teleproto").TelegramClient} client
+ * @param {string} rawPeer
+ * @param {number} messageId
+ * @returns {Promise<{raw: object, info: object}>}
+ */
+export async function openMedia(client, rawPeer, messageId) {
+    const entity = await resolveEntity(client, rawPeer);
+    const [raw] = await client.getMessages(entity, { ids: [messageId] });
+    if (!raw) throw new ProtocolError("message_not_found", "Сообщение не найдено.");
+    const info = describeMedia(raw.media);
+    if (!info || !info.downloadable) {
+        throw new ProtocolError("no_media", "У сообщения нет файла.");
+    }
+    return { raw, info };
+}
+
+/**
+ * Поток байтов файла — целиком или запрошенным диапазоном.
+ *
+ * Файл никогда не собирается в память целиком: видео на 200 МБ — это 200 МБ
+ * RSS шлюза, общего для всех аккаунтов. Наружу уходит генератор, который
+ * тянет из Telegram ровно столько, сколько успел прочитать клиент.
+ *
+ * @param {import("teleproto").TelegramClient} client
+ * @param {{raw: object, info: object}} opened результат `openMedia`
+ * @param {{range?: {start: number, end: number}|null, signal?: AbortSignal}} [options]
+ * @returns {AsyncGenerator<Buffer>}
+ */
+export function streamMedia(client, opened, { range = null, signal = undefined } = {}) {
+    const { raw, info } = opened;
+    const plan = range
+        ? chunkPlan(range.start, range.end)
+        : { offset: 0, skip: 0, length: info.size ?? Number.MAX_SAFE_INTEGER };
+    const chunks = client.iterDownload(raw, {
+        offset: plan.offset,
+        // Границу ставим по концу диапазона: без неё Range на первый килобайт
+        // выкачал бы файл до конца.
+        limit: range ? plan.skip + plan.length : undefined,
+        signal,
+    });
+    return sliceChunks(chunks, plan.skip, plan.length);
+}
+
+/**
+ * Качает превью сообщения.
+ *
+ * В отличие от файла, обрезка собирается в память целиком: она весит
+ * килобайты, а поток ради них — лишняя сложность на самом частом запросе.
+ *
+ * `ifNoneMatch` проверяется до обращения к Telegram за файлом: смысл метки не
+ * только в сэкономленном ответе клиенту, но и в несделанной загрузке.
+ *
+ * @param {import("teleproto").TelegramClient} client
+ * @param {string} rawPeer
+ * @param {number} messageId
+ * @param {string} want "s" | "m"
+ * @param {{ifNoneMatch?: string}} [options]
+ * @returns {Promise<{etag: string, mimeType: string, buffer: Buffer|null, notModified: boolean}>}
+ */
+export async function downloadThumb(client, rawPeer, messageId, want, { ifNoneMatch } = {}) {
+    const { raw, info } = await openMedia(client, rawPeer, messageId);
+    const type = pickThumbType(info.thumbs, want);
+    // Обрезки нет — выдумывать её нечем. Клиенту в этом случае остаётся
+    // размытая заглушка из `stripped`, которая уже приехала в сообщении.
+    if (!type) throw new ProtocolError("no_thumb", "У вложения нет превью.");
+
+    const size = rawMediaSizes(raw.media).find((s) => s?.type === type);
+    if (!size) throw new ProtocolError("no_thumb", "У вложения нет превью.");
+
+    // Идентификатор файла в Telegram неизменен, поэтому метка сильная:
+    // отредактированное сообщение получает новый файл и новую метку само.
+    const fileId = idToString(raw.media?.photo?.id ?? raw.media?.document?.id) || String(messageId);
+    const etag = `"${fileId}-${type}"`;
+    if (ifNoneMatch && ifNoneMatch === etag) {
+        return { etag, mimeType: "image/jpeg", buffer: null, notModified: true };
+    }
+
+    const buffer = await client.downloadMedia(raw, { thumb: size });
+    return {
+        etag,
+        mimeType: "image/jpeg",
+        buffer: Buffer.from(buffer || []),
+        notModified: false,
+    };
 }

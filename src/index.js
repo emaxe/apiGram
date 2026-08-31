@@ -11,9 +11,13 @@ import { createHttpApp } from "./server/http.js";
 import { attachWs } from "./server/ws.js";
 import { startUpdatesLog, stopUpdatesLog } from "./server/updatesLog.js";
 import { sessionManager } from "./telegram/sessionManager.js";
+import { describeProxy } from "./telegram/proxyUrl.js";
 import { config } from "./config.js";
 
 config.assertCredentials();
+// Кривой PROXY_URL — ошибка конфигурации, а не рантайма: лучше не подняться
+// совсем, чем молча ходить в Telegram напрямую, раскрывая настоящий IP.
+config.assertProxy();
 
 const app = createHttpApp();
 const server = app.listen(config.port, config.host, () => {
@@ -28,6 +32,38 @@ const server = app.listen(config.port, config.host, () => {
             "ВНИМАНИЕ: ADMIN_TOKEN не задан, а сервер слушает не только localhost —\n" +
             "  POST /v1/accounts открыт всем. Задайте ADMIN_TOKEN в .env."
         );
+    }
+    if (config.corsOrigins.length > 0) {
+        console.log(`apiGram CORS: ${config.corsOrigins.join(", ")}`);
+        // С «*» запрос к шлюзу может отправить любая открытая пользователем
+        // страница. Без ADMIN_TOKEN она заодно сможет создавать аккаунты.
+        if (config.corsOrigins.includes("*")) {
+            console.warn(
+                "ВНИМАНИЕ: CORS_ORIGINS=* разрешает запросы с любого сайта.\n" +
+                "  Укажите конкретные источники, например http://127.0.0.1:8080." +
+                (config.adminToken ? "" : "\n  Вдобавок ADMIN_TOKEN пуст: создание аккаунтов открыто всем.")
+            );
+        }
+    }
+    if (config.proxy) {
+        // Источник называем, когда он не PROXY_URL: прокси из системной переменной
+        // в .env не виден, и без подсказки непонятно, откуда он вообще взялся.
+        const from = config.proxySource === "PROXY_URL" ? "" : `из ${config.proxySource}, `;
+        console.log(`apiGram proxy: ${describeProxy(config.proxy)} (${from}таймаут ${config.proxy.timeout} с)`);
+        // Basic-авторизация — это кодировка, а не шифрование: по http:// пароль от
+        // прокси уходит открытым текстом. Сам MTProto внутри туннеля зашифрован.
+        if (config.proxy.kind === "http" && !config.proxy.tls && config.proxy.username) {
+            console.warn(
+                `ВНИМАНИЕ: ${config.proxySource}=http:// с логином — Proxy-Authorization передаётся открытым текстом.\n` +
+                "  Для прокси за пределами локальной сети используйте https://."
+            );
+        }
+        if (config.proxy.insecureTls) {
+            console.warn(
+                `ВНИМАНИЕ: ${config.proxySource} с ?insecure=1 — сертификат прокси не проверяется.\n` +
+                "  Пароль от прокси в этом режиме уязвим к перехвату."
+            );
+        }
     }
 });
 

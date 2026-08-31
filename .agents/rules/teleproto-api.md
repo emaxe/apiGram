@@ -20,6 +20,12 @@
 | `signInUser` без `onError` | `onError` обязателен; без него неверный код даёт `TypeError` вместо `PHONE_CODE_INVALID` | всегда передавать `onError` |
 | `sendFile(peer, {name, buffer})` | простой объект не принимается, падает с «Cannot use [object Object] as file» | заворачивать в `CustomFile` |
 | `sendReadAcknowledge()` | метода не существует | `markAsRead(entity, maxId)` |
+| `proxy: { type: "http", … }` | поддержаны только SOCKS4/5 и MTProxy; `PromisedNetSockets` бросает «Invalid sockets params» без `socksType` | свой транспорт в `src/telegram/proxySocket.js` через опцию `networkSocket` |
+
+`src/telegram/proxySocket.js` наследуется от `PromisedNetSockets` и опирается на его
+внутренние поля (`chunks`, `headOffset`, `available`, `canRead`, `resolveRead`, `closed`,
+`client`). При обновлении teleproto сверять `extensions/PromisedNetSockets.js` — сквозные
+тесты прокси в `test/unit.test.js` упадут, если апстрим их переименует.
 
 ## Сериализация
 

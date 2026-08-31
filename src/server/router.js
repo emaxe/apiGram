@@ -14,6 +14,12 @@ import * as authApi from "../telegram/auth.js";
 import * as msg from "../telegram/messages.js";
 import * as dlg from "../telegram/dialogs.js";
 import * as prof from "../telegram/profile.js";
+import { createDownloadGate } from "../telegram/media.js";
+import { parseRange, mediaResponseHead } from "./range.js";
+
+// Пропускник загрузок общий на процесс: ограничение считается по аккаунту,
+// а не по запросу, и пересоздавать его на каждый роутер значило бы снять его.
+const downloadGate = createDownloadGate();
 
 /** @returns {import("express").Router} */
 export function buildRouter() {
@@ -253,21 +259,75 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
-    // Единственный маршрут, отдающий не JSON, а бинарь. filename* с UTF-8 —
-    // чтобы не терять кириллицу и эмодзи в именах файлов.
-    r.get("/accounts/:accountId/chat/:peer/messages/:msgId/file", async (req, res, next) => {
+    // ── Медиа ─────────────────────────────────────────────────────
+    // Два маршрута ниже — единственные, отдающие не JSON, а байты.
+
+    // Превью. Отдельный маршрут нужен ровно затем, чтобы показать вложение,
+    // не выкачивая оригинал: обрезка весит килобайты против мегабайтов файла.
+    r.get("/accounts/:accountId/chat/:peer/messages/:msgId/thumb", async (req, res, next) => {
         try {
             const client = await getClient(req);
-            const media = await msg.downloadMedia(client, req.params.peer,
-                parseInt(req.params.msgId, 10));
-            res.setHeader("Content-Type", media.mimeType || "application/octet-stream");
-            res.setHeader("Content-Length", media.buffer.length);
-            if (media.fileName) {
-                res.setHeader("Content-Disposition",
-                    `attachment; filename*=UTF-8''${encodeURIComponent(media.fileName)}`);
-            }
-            res.send(media.buffer);
+            // Любое значение, кроме "s", означает крупную обрезку: ошибка в
+            // параметре не должна оборачиваться отказом показать картинку.
+            const want = req.query.size === "s" ? "s" : "m";
+            const thumb = await msg.downloadThumb(client, req.params.peer,
+                parseInt(req.params.msgId, 10), want, { ifNoneMatch: req.headers["if-none-match"] });
+
+            res.setHeader("ETag", thumb.etag);
+            // Файл в Telegram неизменен, а правка сообщения меняет метку сама,
+            // поэтому обрезку можно держать в кеше долго и без перепроверок.
+            res.setHeader("Cache-Control", "private, max-age=604800, immutable");
+            if (thumb.notModified) return res.status(304).end();
+
+            res.setHeader("Content-Type", thumb.mimeType);
+            res.setHeader("Content-Length", thumb.buffer.length);
+            res.send(thumb.buffer);
         } catch (err) { next(err); }
+    });
+
+    // Файл целиком или диапазоном. Тело идёт потоком: собрать его в память
+    // значит отдать RSS шлюза во власть самого большого видео в чате.
+    // filename* с UTF-8 — чтобы не терять кириллицу и эмодзи в именах.
+    r.get("/accounts/:accountId/chat/:peer/messages/:msgId/file", async (req, res, next) => {
+        let release = null;
+        try {
+            const client = await getClient(req);
+            const opened = await msg.openMedia(client, req.params.peer, parseInt(req.params.msgId, 10));
+            const { info } = opened;
+
+            const range = parseRange(req.headers.range, info.size);
+            const head = mediaResponseHead(info, range);
+            res.status(head.status);
+            for (const [name, value] of Object.entries(head.headers)) res.setHeader(name, value);
+            // Пустой 206 плеер принимает за конец файла и останавливается —
+            // на запрос за пределами файла нужен именно 416.
+            if (head.status === 416) return res.end();
+
+            // HEAD плеер шлёт первым, чтобы узнать размер и поддержку Range.
+            if (req.method === "HEAD") return res.end();
+
+            // Клиент отваливается на середине постоянно — перемотка видео так и
+            // работает. Без прерывания шлюз продолжал бы качать файл в никуда.
+            const abort = new AbortController();
+            res.on("close", () => { if (!res.writableEnded) abort.abort(); });
+
+            release = await downloadGate.acquire(req.account.accountId);
+            for await (const chunk of msg.streamMedia(client, opened, { range, signal: abort.signal })) {
+                // Обратное давление обязательно: без него чанки копятся в
+                // буфере сокета, и экономия памяти на стриминге пропадает.
+                if (!res.write(chunk)) {
+                    await new Promise((resolve) => res.once("drain", resolve));
+                }
+            }
+            res.end();
+        } catch (err) {
+            // Заголовки уже ушли — сообщить об ошибке нечем: дописать JSON в
+            // тело файла хуже, чем оборвать соединение.
+            if (res.headersSent) return res.destroy();
+            next(err);
+        } finally {
+            if (release) release();
+        }
     });
 
     // ── Статус присутствия ─────────────────────────────────────────

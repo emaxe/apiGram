@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-31
+
+### Added
+
+- **Media descriptions on every message** (`src/telegram/media.js`): `describeMedia()`
+  returns `kind`, `mimeType`, `fileName`, `size`, `width`/`height`, `duration`,
+  a decoded `waveform`, `thumbs[]` and the inline `stripped` preview. Without sizes
+  known before the first byte, a client cannot draw a placeholder of the right shape,
+  and the message list jumps as every image loads. `kind` is decided by document
+  attributes rather than the mime type: a Telegram GIF is `video/mp4`, and a video
+  sticker carries both video and sticker attributes.
+- **`GET …/messages/:msgId/thumb?size=s|m`**: JPEG thumbnail with a strong `ETag` and
+  a long `Cache-Control`. `If-None-Match` is checked before the download, so a cached
+  thumbnail costs nothing on the Telegram side either.
+- **New message fields** (`normalizeMessage`): `chatId` — always marked, the single
+  honest chat key, closing the `peerId`/`fromId` ambiguity on the server side;
+  `groupedId` (albums, kept as a string — a `long` of ~10^18 loses digits as a
+  `Number`), `media`, `fwdFrom`, `viaBotId` and `senderName`.
+- **`read_outbox` WebSocket event** (`src/telegram/listener.js`): fires when the peer
+  reads our messages, carrying `peerId` and `maxId`. Without it a client cannot tell
+  "delivered" from "read" and has to omit the second checkmark entirely.
+- **CORS support** (`src/server/cors.js`), disabled by default and enabled through
+  `CORS_ORIGINS`. An explicit origin allowlist rather than a wildcard: with an empty
+  `ADMIN_TOKEN` the `POST /v1/accounts` endpoint is open, so a wildcard would let any
+  page the user visits create accounts on their local gateway. The `Origin` check also
+  covers the WebSocket handshake, which CORS rules do not reach.
+- **Proxy support for the MTProto connection** (`src/telegram/proxyUrl.js`,
+  `src/telegram/proxySocket.js`), configured with a single `PROXY_URL` plus
+  `PROXY_TIMEOUT`. `socks5://`, `socks4://` and `mtproxy://` go through teleproto's own
+  `proxy` option; `http://` and `https://` are implemented here, because the library
+  supports neither — `PromisedNetSockets` rejects any descriptor without `socksType`.
+  The HTTP transport plugs into the documented `networkSocket` extension point and
+  speaks `CONNECT` over `node:net` / `node:tls`, with no new dependency. It subclasses
+  `PromisedNetSockets` and overrides `connect` alone: the read machinery there is
+  subtle, and a copy of it would drift from upstream. The proxy response header is
+  read one byte at a time — bytes that arrive in the same TCP segment after the blank
+  line are already MTProto frames and must not be swallowed. `Proxy-Authorization` is
+  sent up front rather than after a `407`, since every data centre opens its own
+  tunnel. A malformed `PROXY_URL` aborts startup instead of silently falling back to a
+  direct connection, which would leak the real IP; passwords and MTProxy secrets never
+  reach the log. Proxy failures map to `502`/`504` instead of `500`.
+  `PROXY_FROM_ENV=true` additionally accepts the conventional `https_proxy` → `all_proxy` →
+  `http_proxy` variables (either case, `PROXY_URL` still wins). It is opt-in on purpose: those
+  variables are routinely set in a shell for unrelated tasks — `run.sh` already passes
+  `--noproxy '*'` to `curl` because of them — and a gateway holding live Telegram sessions must
+  not follow them silently. The startup line names the variable the settings came from.
+
+### Changed
+
+- **`GET …/messages/:msgId/file` streams instead of buffering** (`streamMedia`):
+  `downloadMedia` used to build the whole file in memory, so a 200 MB video meant
+  200 MB of gateway RSS — shared by every account on the process. The route now pulls
+  chunks through `client.iterDownload()`, honours `Range` (`206` with `Content-Range`,
+  `416` beyond the end), applies backpressure, and stops downloading as soon as the
+  client disconnects. At most two concurrent downloads per account; the rest queue.
+  Memory use no longer depends on file size: a test streams 512 MB and watches RSS —
+  the buffered version grew by a full gigabyte on the same input.
+- Raw-update classification extracted into the pure `classifyRawUpdate()` function so
+  it can be tested without a live Telegram connection.
+
 ## [1.0.0] - 2026-08-30
 
 First public release.
@@ -67,5 +127,6 @@ First public release.
   second one.
 - `downloadMedia` returns the real MIME type and a `Content-Disposition` filename.
 
-[Unreleased]: https://github.com/emaxe/apiGram/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/emaxe/apiGram/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/emaxe/apiGram/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/emaxe/apiGram/releases/tag/v1.0.0

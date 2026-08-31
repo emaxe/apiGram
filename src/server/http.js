@@ -9,6 +9,8 @@ import { getAccount, listAccounts } from "./accounts.js";
 import { bearerToken } from "./bearer.js";
 import { buildRouter } from "./router.js";
 import { toHttpError } from "./httpErrors.js";
+import { corsMiddleware } from "./cors.js";
+import { config } from "../config.js";
 
 // Файлы держим в памяти: они сразу уходят в Telegram, писать их на диск незачем —
 // это лишний след с пользовательским контентом. Отсюда и жёсткие лимиты размера.
@@ -29,10 +31,13 @@ const uploadAvatar = multer({
 export function createHttpApp() {
     const app = express();
     app.disable("x-powered-by");
+    // CORS идёт первым: предварительный запрос OPTIONS не несёт ни тела,
+    // ни токена, и до разбора JSON с проверкой Bearer доходить не должен.
+    app.use(corsMiddleware(config.corsOrigins));
     app.use(express.json({ limit: "10mb" }));
 
     app.get("/v1/health", (req, res) => {
-        res.json({ ok: true, version: "1.0.0" });
+        res.json({ ok: true, version: config.version });
     });
 
     // Список аккаунтов токена. Пустой результат означает, что токен не опознан:

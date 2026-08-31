@@ -85,6 +85,91 @@ port_busy() {
     fi
 }
 
+# Идентификаторы процессов, слушающих порт.
+port_pids() {
+    _port=$(env_get PORT 3111)
+    command -v lsof >/dev/null 2>&1 || return 0
+    lsof -nP -iTCP:"$_port" -sTCP:LISTEN -t 2>/dev/null
+}
+
+# curl до собственного сервера.
+#
+# `--noproxy` обязателен. Системный прокси (`http_proxy`/`https_proxy`) ловит и
+# обращения к 127.0.0.1: запрос уходит наружу и возвращается ошибкой прокси —
+# чаще всего 500. Выглядит это как мёртвый сервер, хотя он жив и отвечает.
+curl_local() {
+    curl -fsS --max-time 5 --noproxy '*' "$@"
+}
+
+# Рассказывает, кто держит порт, и предлагает освободить его.
+#
+# Без этого «порт занят» — тупик: чаще всего его держит собственный забытый
+# процесс, оставшийся от прошлого запуска или от фоновой проверки, и узнать об
+# этом можно только руками через lsof.
+port_report() {
+    _port=$(env_get PORT 3111)
+    _pids=$(port_pids)
+
+    if [ -z "$_pids" ]; then
+        # lsof отсутствует — сказать про порт нечего, но и мешать не будем.
+        return 1
+    fi
+
+    for _pid in $_pids; do
+        _cmd=$(ps -o command= -p "$_pid" 2>/dev/null | cut -c1-90)
+        info "  PID $_pid: ${_cmd:-неизвестный процесс}"
+        _cwd=$(lsof -a -p "$_pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+        if [ -n "$_cwd" ]; then
+            if [ "$_cwd" = "$ROOT" ]; then
+                dim "           каталог: $_cwd  — это apiGram: другое окно или забытый запуск"
+            else
+                dim "           каталог: $_cwd"
+            fi
+        fi
+    done
+
+    if command -v curl >/dev/null 2>&1 && curl_local "$(base_url)/v1/health" >/dev/null 2>&1; then
+        dim "  на $(base_url)/v1/health он отвечает — то есть health скажет, что всё хорошо"
+    fi
+    return 0
+}
+
+# Завершает процессы на порту. Сначала вежливо, потом жёстко.
+free_port() {
+    _port=$(env_get PORT 3111)
+    _pids=$(port_pids)
+    [ -n "$_pids" ] || return 0
+
+    for _pid in $_pids; do kill "$_pid" 2>/dev/null; done
+    _n=0
+    while [ $_n -lt 10 ]; do
+        port_busy || { ok "порт $_port освобождён."; return 0; }
+        sleep 1
+        _n=$((_n + 1))
+    done
+
+    warn "процесс не завершился за 10 с, отправляю KILL."
+    for _pid in $(port_pids); do kill -9 "$_pid" 2>/dev/null; done
+    sleep 1
+    if port_busy; then
+        fail "порт $_port всё ещё занят."
+        return 1
+    fi
+    ok "порт $_port освобождён."
+}
+
+# Общая ветка для start и dev: порт занят — объясниться и предложить выход.
+handle_busy_port() {
+    fail "порт $(env_get PORT 3111) уже занят."
+    port_report || {
+        dim "  кто именно — сказать нечем: lsof не найден в PATH"
+        return 1
+    }
+    printf '\n'
+    confirm "Завершить эти процессы и продолжить?" || return 1
+    free_port
+}
+
 require_node() {
     command -v node >/dev/null 2>&1 || die "node не найден в PATH."
     _major=$(node -p 'process.versions.node.split(".")[0]')
@@ -145,8 +230,7 @@ cmd_start() {
     require_deps || return 1
     require_env || warn "сервер стартует, но авторизация аккаунтов работать не будет."
     if port_busy; then
-        fail "порт $(env_get PORT 3111) уже занят."
-        return 1
+        handle_busy_port || return 1
     fi
     dim "  $(base_url)/v1    Ctrl+C — остановить"
     printf '\n'
@@ -159,8 +243,7 @@ cmd_dev() {
     require_deps || return 1
     require_env || warn "сервер стартует, но авторизация аккаунтов работать не будет."
     if port_busy; then
-        fail "порт $(env_get PORT 3111) уже занят."
-        return 1
+        handle_busy_port || return 1
     fi
     dim "  $(base_url)/v1    перезапуск при изменении src/    Ctrl+C — остановить"
     printf '\n'
@@ -207,6 +290,11 @@ cmd_env() {
     printf '  %-20s %s\n' "DATA_DIR"         "$(env_get DATA_DIR ./data)"
     printf '  %-20s %s\n' "LOG_UPDATES"      "$(env_get LOG_UPDATES false)"
     printf '  %-20s %s\n' "UPDATES_MAX_MB"   "$(env_get UPDATES_MAX_MB 50)"
+    printf '  %-20s %s\n' "CORS_ORIGINS"     "$(env_get CORS_ORIGINS)"
+    # В PROXY_URL живёт пароль от прокси — показываем маской, как и прочие секреты.
+    printf '  %-20s %s\n' "PROXY_URL"        "$(mask "$(env_get PROXY_URL)")"
+    printf '  %-20s %s\n' "PROXY_TIMEOUT"    "$(env_get PROXY_TIMEOUT 5)"
+    printf '  %-20s %s\n' "PROXY_FROM_ENV"   "$(env_get PROXY_FROM_ENV false)"
     printf '\n'
     dim "  правка: \$EDITOR .env    (секреты показаны маской)"
 }
@@ -217,7 +305,7 @@ cmd_health() {
     _url="$(base_url)/v1/health"
     dim "  GET $_url"
     printf '\n'
-    if curl -fsS --max-time 5 "$_url"; then
+    if curl_local "$_url"; then
         printf '\n'
         ok "сервер отвечает."
     else
@@ -261,11 +349,30 @@ cmd_doctor() {
         fail ".env отсутствует"
     fi
 
+    _proxy=$(env_get PROXY_URL)
+    _proxy_src="PROXY_URL"
+    if [ -z "$_proxy" ] && [ "$(env_get PROXY_FROM_ENV false)" = "true" ]; then
+        # Тот же порядок, что и в src/telegram/proxyUrl.js.
+        for _name in https_proxy HTTPS_PROXY all_proxy ALL_PROXY http_proxy HTTP_PROXY; do
+            eval "_value=\${$_name}"
+            if [ -n "$_value" ]; then _proxy="$_value"; _proxy_src="$_name"; break; fi
+        done
+    fi
+    if [ -n "$_proxy" ]; then
+        # Схему и хост показать полезно, а всё до @ — это логин с паролем.
+        ok "прокси из $_proxy_src: $(printf '%s' "$_proxy" | sed 's|://.*@|://***@|')"
+    elif [ "$(env_get PROXY_FROM_ENV false)" = "true" ]; then
+        warn "PROXY_FROM_ENV=true, но ни PROXY_URL, ни системные переменные не заданы"
+    else
+        ok "прокси не задан — прямое подключение"
+    fi
+
     _data=$(env_get DATA_DIR ./data)
     [ -d "$ROOT/${_data#./}" ] && ok "каталог данных $_data" || warn "каталог данных $_data будет создан при старте"
 
     if port_busy; then
         warn "порт $(env_get PORT 3111) занят — сервер уже запущен?"
+        port_report || dim "  кто именно — сказать нечем: lsof не найден в PATH"
     else
         ok "порт $(env_get PORT 3111) свободен"
     fi
