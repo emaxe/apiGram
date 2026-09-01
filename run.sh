@@ -5,7 +5,7 @@
 #   ./run.sh              меню
 #   ./run.sh <команда>    прямой вызов, напр. ./run.sh dev
 #
-# Команды: install | start | dev | test | smoke | env | health | doctor | clean
+# Команды: install | start | start:proxy | dev | dev:proxy | test | smoke | proxy | env | health | doctor | clean
 
 set -u
 
@@ -68,6 +68,111 @@ mask() {
     else
         printf '%s…%s' "$(printf '%s' "$_v" | cut -c1-2)" "$(printf '%s' "$_v" | rev | cut -c1-2 | rev)"
     fi
+}
+
+mask_proxy_url() {
+    _u=$1
+    if [ -z "$_u" ]; then
+        printf '%s(пусто)%s' "$C_DIM" "$C_RESET"
+    else
+        printf '%s' "$_u" | sed -e 's|://.*@|://***@|' -e 's|secret=[^&]*|secret=***|'
+    fi
+}
+
+proxy_cache_file() {
+    _data=$(env_get DATA_DIR ./data)
+    _dir="$ROOT/${_data#./}"
+    printf '%s/.proxy' "$_dir"
+}
+
+cached_proxy_get() {
+    _file=$(proxy_cache_file)
+    if [ -f "$_file" ]; then
+        _val=''
+        read -r _val < "$_file" 2>/dev/null || true
+        printf '%s' "$_val"
+    fi
+}
+
+cached_proxy_set() {
+    _val=$1
+    _file=$(proxy_cache_file)
+    _dir=$(dirname "$_file")
+    [ -d "$_dir" ] || { mkdir -p "$_dir" && chmod 700 "$_dir" 2>/dev/null || true; }
+    printf '%s\n' "$_val" > "$_file"
+    chmod 600 "$_file" 2>/dev/null || true
+}
+
+cached_proxy_clear() {
+    _file=$(proxy_cache_file)
+    if [ -f "$_file" ]; then
+        rm -f "$_file"
+    fi
+}
+
+suggest_proxy() {
+    _env_proxy=$(env_get PROXY_URL)
+    if [ -n "$_env_proxy" ]; then
+        printf '%s' "$_env_proxy"
+        return 0
+    fi
+    for _name in https_proxy HTTPS_PROXY all_proxy ALL_PROXY http_proxy HTTP_PROXY; do
+        eval "_val=\${$_name-}"
+        if [ -n "$_val" ]; then
+            printf '%s' "$_val"
+            return 0
+        fi
+    done
+}
+
+ensure_proxy() {
+    if [ -n "${PROXY_URL-}" ]; then
+        cached_proxy_set "$PROXY_URL"
+        ok "прокси из окружения: $(mask_proxy_url "$PROXY_URL") (сохранён в кэш)" >&2
+        printf '%s' "$PROXY_URL"
+        return 0
+    fi
+
+    _cached=$(cached_proxy_get)
+    if [ -n "$_cached" ]; then
+        ok "прокси из кэша: $(mask_proxy_url "$_cached")" >&2
+        dim "  (для изменения: ./run.sh proxy или запуск с флагом --reset)" >&2
+        printf '%s' "$_cached"
+        return 0
+    fi
+
+    warn "прокси не настроен в кэше." >&2
+    dim "  Формат: socks5://[user:pass@]host:port, http://host:port, mtproxy://secret@host:443" >&2
+
+    _suggest=$(suggest_proxy)
+    if [ -n "$_suggest" ]; then
+        dim "  Найдено значение по умолчанию: $(mask_proxy_url "$_suggest")" >&2
+        printf 'Введите URL прокси [%s]: ' "$_suggest" >&2
+        read -r _ans || { fail "ввод отменён." >&2; return 1; }
+        _ans=$(printf '%s' "$_ans" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [ -z "$_ans" ]; then
+            _ans="$_suggest"
+        fi
+    else
+        printf 'Введите URL прокси: ' >&2
+        read -r _ans || { fail "ввод отменён." >&2; return 1; }
+        _ans=$(printf '%s' "$_ans" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    fi
+
+    if [ -z "$_ans" ]; then
+        fail "прокси не указан, запуск отменён." >&2
+        return 1
+    fi
+
+    if ! printf '%s' "$_ans" | grep -q '://'; then
+        warn "в адресе нет схемы, предполагаю socks5://$_ans" >&2
+        _ans="socks5://$_ans"
+    fi
+
+    cached_proxy_set "$_ans"
+    ok "прокси сохранён в кэш: $(mask_proxy_url "$_ans")" >&2
+    printf '%s' "$_ans"
+    return 0
 }
 
 base_url() {
@@ -237,6 +342,27 @@ cmd_start() {
     npm start
 }
 
+cmd_start_proxy() {
+    _arg=${1-}
+    if [ "$_arg" = "--reset" ] || [ "$_arg" = "-r" ] || [ "$_arg" = "--change" ] || [ "$_arg" = "--new" ]; then
+        cached_proxy_clear
+    elif [ -n "$_arg" ] && [ "$_arg" != "--proxy" ] && [ "$_arg" != "-p" ] && [ "$_arg" != "--with-proxy" ]; then
+        cached_proxy_set "$_arg"
+    fi
+    head "Запуск сервера с прокси (production)"
+    require_node
+    require_deps || return 1
+    require_env || warn "сервер стартует, но авторизация аккаунтов работать не будет."
+    if port_busy; then
+        handle_busy_port || return 1
+    fi
+    _proxy=$(ensure_proxy) || return 1
+    dim "  $(base_url)/v1    Ctrl+C — остановить"
+    dim "  прокси: $(mask_proxy_url "$_proxy")"
+    printf '\n'
+    PROXY_URL="$_proxy" npm start
+}
+
 cmd_dev() {
     head "Запуск сервера (watch)"
     require_node
@@ -248,6 +374,27 @@ cmd_dev() {
     dim "  $(base_url)/v1    перезапуск при изменении src/    Ctrl+C — остановить"
     printf '\n'
     node --watch src/index.js
+}
+
+cmd_dev_proxy() {
+    _arg=${1-}
+    if [ "$_arg" = "--reset" ] || [ "$_arg" = "-r" ] || [ "$_arg" = "--change" ] || [ "$_arg" = "--new" ]; then
+        cached_proxy_clear
+    elif [ -n "$_arg" ] && [ "$_arg" != "--proxy" ] && [ "$_arg" != "-p" ] && [ "$_arg" != "--with-proxy" ]; then
+        cached_proxy_set "$_arg"
+    fi
+    head "Запуск сервера с автоперезапуском (прокси)"
+    require_node
+    require_deps || return 1
+    require_env || warn "сервер стартует, но авторизация аккаунтов работать не будет."
+    if port_busy; then
+        handle_busy_port || return 1
+    fi
+    _proxy=$(ensure_proxy) || return 1
+    dim "  $(base_url)/v1    перезапуск при изменении src/    Ctrl+C — остановить"
+    dim "  прокси: $(mask_proxy_url "$_proxy")"
+    printf '\n'
+    PROXY_URL="$_proxy" node --watch src/index.js
 }
 
 cmd_test() {
@@ -269,6 +416,116 @@ cmd_smoke() {
     confirm "Продолжить?" || return 0
     printf '\n'
     BASE="$(base_url)/v1" node scripts/smoke.mjs
+}
+
+cmd_smoke_proxy() {
+    _arg=${1-}
+    if [ "$_arg" = "--reset" ] || [ "$_arg" = "-r" ] || [ "$_arg" = "--change" ] || [ "$_arg" = "--new" ]; then
+        cached_proxy_clear
+    elif [ -n "$_arg" ] && [ "$_arg" != "--proxy" ] && [ "$_arg" != "-p" ] && [ "$_arg" != "--with-proxy" ]; then
+        cached_proxy_set "$_arg"
+    fi
+    head "Сквозная проверка на живом аккаунте (прокси)"
+    require_node
+    require_deps || return 1
+    warn "скрипт логинится в реальный Telegram и пишет в «Избранное»."
+    if ! port_busy; then
+        fail "сервер не слушает $(base_url) — запустите его в другом терминале (./run.sh start:proxy)."
+        return 1
+    fi
+    _proxy=$(ensure_proxy) || return 1
+    confirm "Продолжить?" || return 0
+    printf '\n'
+    PROXY_URL="$_proxy" BASE="$(base_url)/v1" node scripts/smoke.mjs
+}
+
+cmd_proxy() {
+    _action=${1-}
+    _arg=${2-}
+
+    case "$_action" in
+        set)
+            if [ -n "$_arg" ]; then
+                _input="$_arg"
+            else
+                printf 'Введите URL прокси: '
+                read -r _input || return 0
+            fi
+            _input=$(printf '%s' "$_input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -z "$_input" ]; then
+                fail "пустой адрес прокси."
+                return 1
+            fi
+            if ! printf '%s' "$_input" | grep -q '://'; then
+                warn "в адресе нет схемы, предполагаю socks5://$_input"
+                _input="socks5://$_input"
+            fi
+            cached_proxy_set "$_input"
+            ok "прокси сохранён: $(mask_proxy_url "$_input")"
+            ;;
+        reset|clear|rm)
+            cached_proxy_clear
+            ok "кэш прокси очищен."
+            ;;
+        show)
+            _cached=$(cached_proxy_get)
+            if [ -n "$_cached" ]; then
+                ok "кэшированный прокси: $(mask_proxy_url "$_cached")"
+            else
+                info "кэш прокси пуст."
+            fi
+            ;;
+        "")
+            head "Настройка прокси"
+            _cached=$(cached_proxy_get)
+            if [ -n "$_cached" ]; then
+                info "  Текущий кэш: $(mask_proxy_url "$_cached")"
+            else
+                info "  Текущий кэш: (пусто)"
+            fi
+            _env_p=$(env_get PROXY_URL)
+            if [ -n "$_env_p" ]; then
+                dim "  В .env задан: $(mask_proxy_url "$_env_p")"
+            fi
+            printf '\n'
+            printf '  1) Задать / изменить прокси\n'
+            printf '  2) Сбросить (очистить кэш)\n'
+            printf '  0) назад\n\n'
+            printf 'Выбор: '
+            read -r _pc || return 0
+            case "$_pc" in
+                1)
+                    printf 'Введите URL прокси: '
+                    read -r _input || return 0
+                    _input=$(printf '%s' "$_input" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                    if [ -n "$_input" ]; then
+                        if ! printf '%s' "$_input" | grep -q '://'; then
+                            warn "в адресе нет схемы, предполагаю socks5://$_input"
+                            _input="socks5://$_input"
+                        fi
+                        cached_proxy_set "$_input"
+                        ok "прокси сохранён: $(mask_proxy_url "$_input")"
+                    else
+                        warn "отменено (пустой ввод)."
+                    fi
+                    ;;
+                2)
+                    cached_proxy_clear
+                    ok "кэш прокси очищен."
+                    ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *)
+            if printf '%s' "$_action" | grep -q '://'; then
+                cached_proxy_set "$_action"
+                ok "прокси сохранён: $(mask_proxy_url "$_action")"
+            else
+                fail "неизвестное действие: $_action (доступны: set, reset, show)"
+                return 1
+            fi
+            ;;
+    esac
 }
 
 cmd_env() {
@@ -295,6 +552,10 @@ cmd_env() {
     printf '  %-20s %s\n' "PROXY_URL"        "$(mask "$(env_get PROXY_URL)")"
     printf '  %-20s %s\n' "PROXY_TIMEOUT"    "$(env_get PROXY_TIMEOUT 5)"
     printf '  %-20s %s\n' "PROXY_FROM_ENV"   "$(env_get PROXY_FROM_ENV false)"
+    _cached_p=$(cached_proxy_get)
+    if [ -n "$_cached_p" ]; then
+        printf '  %-20s %s\n' "PROXY_CACHE"      "$(mask_proxy_url "$_cached_p")"
+    fi
     printf '\n'
     dim "  правка: \$EDITOR .env    (секреты показаны маской)"
 }
@@ -360,11 +621,16 @@ cmd_doctor() {
     fi
     if [ -n "$_proxy" ]; then
         # Схему и хост показать полезно, а всё до @ — это логин с паролем.
-        ok "прокси из $_proxy_src: $(printf '%s' "$_proxy" | sed 's|://.*@|://***@|')"
+        ok "прокси из $_proxy_src: $(mask_proxy_url "$_proxy")"
     elif [ "$(env_get PROXY_FROM_ENV false)" = "true" ]; then
         warn "PROXY_FROM_ENV=true, но ни PROXY_URL, ни системные переменные не заданы"
     else
-        ok "прокси не задан — прямое подключение"
+        ok "прокси не задан в .env — прямое подключение"
+    fi
+
+    _cached_p=$(cached_proxy_get)
+    if [ -n "$_cached_p" ]; then
+        ok "кэш прокси run.sh: $(mask_proxy_url "$_cached_p")"
     fi
 
     _data=$(env_get DATA_DIR ./data)
@@ -384,6 +650,7 @@ cmd_clean() {
     printf '\n'
     printf '  1) node_modules\n'
     printf '  2) лог обновлений data/updates.jsonl\n'
+    printf '  3) кэш прокси run.sh\n'
     printf '  0) назад\n\n'
     printf 'Выбор: '
     read -r _c || return 0
@@ -399,6 +666,12 @@ cmd_clean() {
             confirm "Удалить $_log?" || return 0
             rm -f "$_log" && ok "лог удалён."
             ;;
+        3)
+            _cp_file=$(proxy_cache_file)
+            [ -f "$_cp_file" ] || { warn "кэш прокси отсутствует."; return 0; }
+            confirm "Удалить кэш прокси?" || return 0
+            cached_proxy_clear && ok "кэш прокси удалён."
+            ;;
         *) return 0 ;;
     esac
 }
@@ -409,30 +682,36 @@ menu() {
     while :; do
         printf '\n%sapiGram%s %s%s%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$(base_url)" "$C_RESET"
         printf '\n'
-        printf '  %s1%s) install   установить зависимости\n'        "$C_ACC" "$C_RESET"
-        printf '  %s2%s) start     запустить сервер\n'              "$C_ACC" "$C_RESET"
-        printf '  %s3%s) dev       запустить с автоперезапуском\n'  "$C_ACC" "$C_RESET"
-        printf '  %s4%s) test      юнит-тесты\n'                    "$C_ACC" "$C_RESET"
-        printf '  %s5%s) smoke     сквозная проверка (живой аккаунт)\n' "$C_ACC" "$C_RESET"
-        printf '  %s6%s) env       показать/создать .env\n'         "$C_ACC" "$C_RESET"
-        printf '  %s7%s) health    пинг запущенного сервера\n'      "$C_ACC" "$C_RESET"
-        printf '  %s8%s) doctor    диагностика окружения\n'         "$C_ACC" "$C_RESET"
-        printf '  %s9%s) clean     очистка артефактов\n'            "$C_ACC" "$C_RESET"
-        printf '  %s0%s) выход\n'                                   "$C_ACC" "$C_RESET"
+        printf '  %s1%s) install       установить зависимости\n'                "$C_ACC" "$C_RESET"
+        printf '  %s2%s) start         запустить сервер\n'                      "$C_ACC" "$C_RESET"
+        printf '  %s3%s) start:proxy   запустить сервер с прокси\n'             "$C_ACC" "$C_RESET"
+        printf '  %s4%s) dev           запустить с автоперезапуском\n'          "$C_ACC" "$C_RESET"
+        printf '  %s5%s) dev:proxy     запустить с автоперезапуском (прокси)\n' "$C_ACC" "$C_RESET"
+        printf '  %s6%s) test          юнит-тесты\n'                            "$C_ACC" "$C_RESET"
+        printf '  %s7%s) smoke         сквозная проверка (живой аккаунт)\n'     "$C_ACC" "$C_RESET"
+        printf '  %s8%s) proxy         настройка / сброс кэша прокси\n'         "$C_ACC" "$C_RESET"
+        printf '  %s9%s) env           показать/создать .env\n'                 "$C_ACC" "$C_RESET"
+        printf ' %s10%s) health        пинг запущенного сервера\n'              "$C_ACC" "$C_RESET"
+        printf ' %s11%s) doctor        диагностика окружения\n'                 "$C_ACC" "$C_RESET"
+        printf ' %s12%s) clean         очистка артефактов\n'                    "$C_ACC" "$C_RESET"
+        printf '  %s0%s) выход\n'                                               "$C_ACC" "$C_RESET"
         printf '\nВыбор: '
         read -r choice || { printf '\n'; return 0; }
         case "$choice" in
-            1) cmd_install ;;
-            2) cmd_start ;;
-            3) cmd_dev ;;
-            4) cmd_test ;;
-            5) cmd_smoke ;;
-            6) cmd_env ;;
-            7) cmd_health ;;
-            8) cmd_doctor ;;
-            9) cmd_clean ;;
-            0|q|Q|"") return 0 ;;
-            *) fail "неизвестный пункт: $choice" ;;
+            1|install)                               cmd_install ;;
+            2|start)                                 cmd_start ;;
+            3|"start:proxy"|start-proxy|start_proxy) cmd_start_proxy ;;
+            4|dev)                                   cmd_dev ;;
+            5|"dev:proxy"|dev-proxy|dev_proxy)       cmd_dev_proxy ;;
+            6|test)                                  cmd_test ;;
+            7|smoke)                                 cmd_smoke ;;
+            8|proxy)                                 cmd_proxy ;;
+            9|env)                                   cmd_env ;;
+            10|health)                               cmd_health ;;
+            11|doctor)                               cmd_doctor ;;
+            12|clean)                                cmd_clean ;;
+            0|q|Q|"")                                return 0 ;;
+            *)                                       fail "неизвестный пункт: $choice" ;;
         esac
     done
 }
@@ -440,29 +719,51 @@ menu() {
 usage() {
     printf 'apiGram — сборка и запуск\n\n'
     printf 'Использование: ./run.sh [команда]\n\n'
-    printf '  install   установить зависимости (npm ci / npm install)\n'
-    printf '  start     запустить сервер\n'
-    printf '  dev       запустить с автоперезапуском (node --watch)\n'
-    printf '  test      юнит-тесты\n'
-    printf '  smoke     сквозная проверка на живом аккаунте\n'
-    printf '  env       показать/создать .env\n'
-    printf '  health    пинг запущенного сервера\n'
-    printf '  doctor    диагностика окружения\n'
-    printf '  clean     очистка артефактов\n\n'
+    printf '  install       установить зависимости (npm ci / npm install)\n'
+    printf '  start         запустить сервер\n'
+    printf '  start:proxy   запустить сервер с прокси\n'
+    printf '  dev           запустить с автоперезапуском (node --watch)\n'
+    printf '  dev:proxy     запустить с автоперезапуском через прокси\n'
+    printf '  test          юнит-тесты\n'
+    printf '  smoke         сквозная проверка на живом аккаунте\n'
+    printf '  proxy         настройка / сброс кэшированного прокси\n'
+    printf '  env           показать/создать .env\n'
+    printf '  health        пинг запущенного сервера\n'
+    printf '  doctor        диагностика окружения\n'
+    printf '  clean         очистка артефактов\n\n'
     printf 'Без аргументов открывается интерактивное меню.\n'
 }
 
 case "${1-}" in
-    "")            menu ;;
-    install)       cmd_install ;;
-    start)         cmd_start ;;
-    dev)           cmd_dev ;;
-    test)          cmd_test ;;
-    smoke)         cmd_smoke ;;
-    env)           cmd_env ;;
-    health)        cmd_health ;;
-    doctor)        cmd_doctor ;;
-    clean)         cmd_clean ;;
-    -h|--help|help) usage ;;
-    *)             fail "неизвестная команда: $1"; printf '\n'; usage; exit 1 ;;
+    "")                                  menu ;;
+    install)                             cmd_install ;;
+    start)
+        case "${2-}" in
+            --proxy|-p|--with-proxy)     cmd_start_proxy "${3-}" ;;
+            *)                           cmd_start ;;
+        esac
+        ;;
+    start:proxy|start-proxy|start_proxy) cmd_start_proxy "${2-}" ;;
+    dev)
+        case "${2-}" in
+            --proxy|-p|--with-proxy)     cmd_dev_proxy "${3-}" ;;
+            *)                           cmd_dev ;;
+        esac
+        ;;
+    dev:proxy|dev-proxy|dev_proxy)       cmd_dev_proxy "${2-}" ;;
+    test)                                cmd_test ;;
+    smoke)
+        case "${2-}" in
+            --proxy|-p|--with-proxy)     cmd_smoke_proxy "${3-}" ;;
+            *)                           cmd_smoke ;;
+        esac
+        ;;
+    smoke:proxy|smoke-proxy|smoke_proxy) cmd_smoke_proxy "${2-}" ;;
+    proxy)                               cmd_proxy "${2-}" "${3-}" ;;
+    env)                                 cmd_env ;;
+    health)                              cmd_health ;;
+    doctor)                              cmd_doctor ;;
+    clean)                               cmd_clean ;;
+    -h|--help|help)                      usage ;;
+    *)                                   fail "неизвестная команда: $1"; printf '\n'; usage; exit 1 ;;
 esac

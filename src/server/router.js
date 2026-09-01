@@ -16,6 +16,8 @@ import * as dlg from "../telegram/dialogs.js";
 import * as prof from "../telegram/profile.js";
 import { createDownloadGate } from "../telegram/media.js";
 import { parseRange, mediaResponseHead } from "./range.js";
+import { formatMediaTiming } from "./mediaTiming.js";
+import { config } from "../config.js";
 
 // Пропускник загрузок общий на процесс: ограничение считается по аккаунту,
 // а не по запросу, и пересоздавать его на каждый роутер значило бы снять его.
@@ -290,21 +292,45 @@ export function buildRouter() {
     // filename* с UTF-8 — чтобы не терять кириллицу и эмодзи в именах.
     r.get("/accounts/:accountId/chat/:peer/messages/:msgId/file", async (req, res, next) => {
         let release = null;
+        const startedAt = Date.now();
+        const msgId = parseInt(req.params.msgId, 10);
+        let openedAt = startedAt;
+        let firstByteAt = null;
+        let sent = 0;
+        let status = 0;
+        // Замер пишется и на обрыве соединения: именно оборванные выдачи
+        // интереснее всего — на них плеер и спотыкается.
+        const report = () => {
+            if (!config.logMediaTiming || status === 0) return;
+            console.log("[apiGram]", formatMediaTiming({
+                msgId,
+                status,
+                bytes: sent,
+                openMs: openedAt - startedAt,
+                ttfbMs: firstByteAt === null ? null : firstByteAt - startedAt,
+                totalMs: Date.now() - startedAt,
+            }));
+        };
         try {
             const client = await getClient(req);
-            const opened = await msg.openMedia(client, req.params.peer, parseInt(req.params.msgId, 10));
+            // Описание берётся из кеша: плеер шлёт за одно видео десятки
+            // запросов, и поход в Telegram перед каждым первым байтом — самая
+            // дорогая часть паузы после нажатия.
+            const opened = await msg.openMediaCached(client, req.params.peer, msgId);
+            openedAt = Date.now();
             const { info } = opened;
 
             const range = parseRange(req.headers.range, info.size);
             const head = mediaResponseHead(info, range);
+            status = head.status;
             res.status(head.status);
             for (const [name, value] of Object.entries(head.headers)) res.setHeader(name, value);
             // Пустой 206 плеер принимает за конец файла и останавливается —
             // на запрос за пределами файла нужен именно 416.
-            if (head.status === 416) return res.end();
+            if (head.status === 416) { report(); return res.end(); }
 
             // HEAD плеер шлёт первым, чтобы узнать размер и поддержку Range.
-            if (req.method === "HEAD") return res.end();
+            if (req.method === "HEAD") { report(); return res.end(); }
 
             // Клиент отваливается на середине постоянно — перемотка видео так и
             // работает. Без прерывания шлюз продолжал бы качать файл в никуда.
@@ -313,14 +339,18 @@ export function buildRouter() {
 
             release = await downloadGate.acquire(req.account.accountId);
             for await (const chunk of msg.streamMedia(client, opened, { range, signal: abort.signal })) {
+                if (firstByteAt === null) firstByteAt = Date.now();
+                sent += chunk.length;
                 // Обратное давление обязательно: без него чанки копятся в
                 // буфере сокета, и экономия памяти на стриминге пропадает.
                 if (!res.write(chunk)) {
                     await new Promise((resolve) => res.once("drain", resolve));
                 }
             }
+            report();
             res.end();
         } catch (err) {
+            report();
             // Заголовки уже ушли — сообщить об ошибке нечем: дописать JSON в
             // тело файла хуже, чем оборвать соединение.
             if (res.headersSent) return res.destroy();

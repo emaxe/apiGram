@@ -281,13 +281,26 @@ export function describeMedia(media) {
     return blank(KIND_BY_CLASS[className] || "unsupported");
 }
 
-// upload.getFile принимает только выровненное смещение. 4096 — тот же шаг, что
-// у запрашиваемых чанков, поэтому выравнивание никогда не удлиняет загрузку
-// больше чем на один лишний участок в начале.
+// Наименьшая единица, которую понимает upload.getFile. Ниже неё смещения не
+// бывает вовсе — но одного этого выравнивания мало, см. `chunkPlan`.
 const DOWNLOAD_ALIGN = 4096;
 
 /** Сколько загрузок одного аккаунта шлюз тянет одновременно. */
-export const DOWNLOADS_PER_ACCOUNT = 2;
+export const DOWNLOADS_PER_ACCOUNT = 6;
+
+// Размер куска, который шлюз просит у Telegram за один `upload.getFile`.
+// Больше 1 МБ протокол не принимает, а 512 КБ — размер, на который рассчитаны
+// окна планировщика в самой библиотеке.
+export const DOWNLOAD_PART_SIZE = 512 * 1024;
+
+// Сколько кусков едет из Telegram одновременно.
+//
+// Загрузка упирается не в канал, а в задержку до дата-центра: пока ответ на
+// один `upload.getFile` идёт обратно, соединение простаивает. Четыре куска в
+// полёте превращают 512 КБ за круг в два мегабайта — и ровно во столько же раз
+// быстрее открывается видео. Верхняя граница — не жадность, а память: куски
+// ждут своей очереди на выдачу в буфере, и их суммарный вес и есть эта цифра.
+export const DOWNLOAD_INFLIGHT = 4;
 
 /**
  * План загрузки под запрошенный диапазон байтов.
@@ -295,12 +308,25 @@ export const DOWNLOADS_PER_ACCOUNT = 2;
  * Telegram отдаёт файл только с выровненного смещения, а клиент просит
  * произвольное. Разницу («голову») отбрасываем уже у себя.
  *
+ * Выравнивание идёт по размеру куска, а не по протокольным 4096. Правило
+ * `upload.getFile` жёстче, чем кажется: запрошенный кусок обязан целиком
+ * лежать **внутри одного мегабайта** файла. От смещения, кратного 4096, но не
+ * кратного 512 КБ, каждый второй кусок перешагивает мегабайт — и Telegram
+ * отвечает `LIMIT_INVALID`. Приходит этот отказ не в ответ на запрос, а
+ * отдельным чтением сокета, поэтому до маршрута он не доходит и роняет
+ * процесс целиком. Пока размер куска делит мегабайт, кратное ему смещение
+ * такого запроса не порождает никогда.
+ *
+ * Плата — до одного лишнего куска в начале диапазона. Это ровно то, что и так
+ * выкачивалось: меньше куска у Telegram не попросишь.
+ *
  * @param {number} start первый нужный байт
  * @param {number} end последний нужный байт, включительно
+ * @param {number} [align] размер куска, по которому идёт выравнивание
  * @returns {{offset: number, skip: number, length: number}}
  */
-export function chunkPlan(start, end) {
-    const offset = Math.floor(start / DOWNLOAD_ALIGN) * DOWNLOAD_ALIGN;
+export function chunkPlan(start, end, align = DOWNLOAD_PART_SIZE) {
+    const offset = Math.floor(start / align) * align;
     return { offset, skip: start - offset, length: end - start + 1 };
 }
 
@@ -334,6 +360,69 @@ export async function* sliceChunks(chunks, skip, length) {
         left -= chunk.length;
         if (chunk.length) yield chunk;
         if (left <= 0) return;
+    }
+}
+
+/**
+ * Куски файла: запрашиваются несколькими сразу, отдаются строго по порядку.
+ *
+ * Последовательная выдача стоит одного круга до дата-центра на каждые
+ * `partSize` байт. Через прокси круг занимает сотни миллисекунд, и полсотни
+ * мегабайт видео открываются минуту — при полностью свободном канале.
+ *
+ * Порядок здесь не украшение: перепутанные куски mp4 — это не «слегка
+ * рассыпавшееся видео», а файл, который плеер не открывает вовсе. Поэтому
+ * очередь именно очередь: следующий кусок уходит в сеть сразу, а наружу
+ * попадает только когда дождался своей очереди.
+ *
+ * Генератор ленив, и это тоже обязательное свойство: пока потребитель не взял
+ * кусок, новые не запрашиваются. Иначе Range на первый килобайт видео выкачал
+ * бы файл целиком, а в буфере лежало бы всё, что успело приехать.
+ *
+ * @param {(offset: number) => Promise<Buffer>} fetchPart кусок с указанного смещения
+ * @param {{offset: number, length: number, partSize: number, inflight?: number}} plan
+ * @returns {AsyncGenerator<Buffer>}
+ */
+export async function* orderedParts(fetchPart, { offset, length, partSize, inflight = DOWNLOAD_INFLIGHT }) {
+    if (partSize % DOWNLOAD_ALIGN !== 0) {
+        throw new Error(`partSize должен делиться на ${DOWNLOAD_ALIGN}`);
+    }
+    const end = offset + length;
+    /** @type {Array<Promise<Buffer>>} */
+    const queue = [];
+    let next = offset;
+    let left = length;
+
+    const fill = () => {
+        while (queue.length < inflight && next < end) {
+            const pending = fetchPart(next);
+            // Заглушка вешается сразу, а не когда кусок бросили. Отказ по
+            // куску, за которым уже никто не придёт, — обычное дело: так
+            // заканчивается любая оборванная загрузка. Без обработчика он
+            // всплывает необработанным отказом и роняет процесс целиком, и
+            // повесить его позже нельзя — отказ может прийти раньше.
+            pending.catch(() => {});
+            queue.push(pending);
+            next += partSize;
+        }
+    };
+
+    try {
+        fill();
+        while (queue.length > 0) {
+            const part = await queue.shift();
+            if (part.length === 0) return;
+            const take = part.length > left ? part.subarray(0, left) : part;
+            left -= take.length;
+            yield take;
+            if (left <= 0) return;
+            // Telegram отдал меньше запрошенного — дальше файла нет. Ждать
+            // следующих кусков бессмысленно: они вернутся пустыми.
+            if (part.length < partSize) return;
+            fill();
+        }
+    } finally {
+        queue.length = 0;
     }
 }
 
@@ -391,10 +480,21 @@ export function createDownloadGate(limit = DOWNLOADS_PER_ACCOUNT) {
 }
 
 /**
+ * Достаточная для пузыря длинная сторона превью.
+ *
+ * Пузырь ограничен 320 точками по высоте, то есть на экране втрое плотнее это
+ * меньше тысячи пикселей. Всё, что крупнее, уже не видно, а маршрут превью
+ * собирает ответ в память целиком — в отличие от `/file`.
+ */
+const THUMB_ENOUGH_PX = 1280;
+
+/**
  * Выбирает обрезку под запрошенный размер.
  *
  * `s` — самая мелкая: списку диалогов важен вес, а не детали. `m` — самая
- * крупная из доступных обрезок: пузырь в чате не должен быть мыльным.
+ * мелкая из тех, что уже достаточно чёткие для пузыря: «просто самая крупная»
+ * означала бы у фото оригинал на 2560 px и под мегабайт в памяти шлюза на
+ * каждое сообщение в ленте.
  *
  * @param {{type: string, width: number, height: number}[]} [thumbs]
  * @param {string} want "s" | "m"
@@ -403,7 +503,12 @@ export function createDownloadGate(limit = DOWNLOADS_PER_ACCOUNT) {
 export function pickThumbType(thumbs, want) {
     const list = Array.isArray(thumbs) ? thumbs.filter((t) => t && t.type) : [];
     if (list.length === 0) return null;
-    return want === "s" ? list[0].type : list[list.length - 1].type;
+    if (want === "s") return list[0].type;
+
+    // Список уже отсортирован по возрастанию площади, поэтому первый
+    // подошедший — он же самый лёгкий из подошедших.
+    const enough = list.find((t) => Math.max(t.width, t.height) >= THUMB_ENOUGH_PX);
+    return (enough || list[list.length - 1]).type;
 }
 
 /**

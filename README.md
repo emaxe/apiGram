@@ -68,13 +68,16 @@ The repository ships an interactive helper that covers every mode:
 |---|---|
 | `install` | `npm ci` (from the lock file) or `npm install` |
 | `start` | start the server, checking `.env`, dependencies and port availability |
+| `start:proxy` | start the server via proxy (cached in `data/.proxy`) |
 | `dev` | start with auto-reload (`node --watch src/index.js`) |
+| `dev:proxy` | start with auto-reload via proxy |
 | `test` | unit tests |
 | `smoke` | end-to-end check against a live account (`scripts/smoke.mjs`) |
+| `proxy` | configure, show or reset the cached proxy |
 | `env` | print the configuration with secrets masked, create `.env` from the example |
 | `health` | `GET /v1/health` against the address from `.env` |
 | `doctor` | diagnostics: Node version, dependencies, credentials, data directory, port |
-| `clean` | remove `node_modules` or the updates log |
+| `clean` | remove `node_modules`, updates log, or proxy cache |
 
 The address used by `start` / `health` / `smoke` is read from `.env` rather than hard-coded.
 `clean` never touches `data/accounts.json` — that file holds the Telegram sessions.
@@ -89,6 +92,7 @@ The address used by `start` / `health` / `smoke` is read from `.env` rather than
 | `DATA_DIR` | `./data` | account registry and updates log (mode `0600`) |
 | `LOG_UPDATES` | `false` | write the update stream to `data/updates.jsonl` |
 | `UPDATES_MAX_MB` | `50` | log rotation threshold |
+| `LOG_MEDIA_TIMING` | `false` | log one timing line per file response: description, first byte, rate |
 | `CORS_ORIGINS` | empty | origins allowed to make browser requests (comma-separated); empty = CORS disabled |
 | `PROXY_URL` | empty | proxy for the MTProto connection: `socks5://`, `socks4://`, `http://`, `https://`, `mtproxy://`; empty = direct connection |
 | `PROXY_TIMEOUT` | `5` | proxy connection timeout, seconds |
@@ -185,6 +189,11 @@ Events (`JSON`, every one carries `accountEvent: true`):
 | `read_outbox` | `peerId`, `maxId` — the peer read our messages |
 | `session_closed` | `reason` — logged out, the socket closes with code `4003` |
 | `error` | `error` — session unavailable, the socket closes with code `4002` |
+
+Both read boundaries also come with every dialog in `GET /dialogs`
+(`readInboxMaxId`, `readOutboxMaxId`). An update fires once: a client that was
+not listening at that moment — or was not installed yet — has no other way to
+learn what the peer has already read.
 
 Close codes: `4001` — bad token or the account is not authorized,
 `4002` — session unavailable, `4003` — logged out.

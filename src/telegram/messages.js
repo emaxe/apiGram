@@ -2,7 +2,16 @@ import { Api, errors } from "teleproto";
 import { CustomFile } from "teleproto/client/uploads.js";
 import { resolveEntity, toMarkedId } from "./entities.js";
 import { idToString } from "./serialize.js";
-import { describeMedia, chunkPlan, sliceChunks, pickThumbType, rawMediaSizes } from "./media.js";
+import {
+    describeMedia,
+    chunkPlan,
+    sliceChunks,
+    orderedParts,
+    pickThumbType,
+    rawMediaSizes,
+    DOWNLOAD_PART_SIZE,
+    DOWNLOAD_INFLIGHT,
+} from "./media.js";
 import { ProtocolError } from "./errors.js";
 
 const { FloodWaitError } = errors;
@@ -302,30 +311,128 @@ export async function openMedia(client, rawPeer, messageId) {
 }
 
 /**
+ * Сколько держать описание вложения.
+ *
+ * Ссылка на файл в Telegram живёт часами, но не вечно, и протухшую отличить
+ * нечем, кроме отказа на загрузке. Минуты хватает на просмотр видео целиком со
+ * всеми перемотками — а до срока годности ссылки отсюда далеко.
+ */
+export const MEDIA_INFO_TTL_MS = 2 * 60 * 1000;
+
+/** Сколько описаний помнить на аккаунт. */
+const MEDIA_INFO_LIMIT = 64;
+
+/**
+ * Оборачивает [openMedia] в кеш с коротким сроком.
+ *
+ * Плеер шлёт за одно видео десятки запросов — проба, старт, каждая перемотка,
+ * — и каждый из них платил бы `getEntity` и `getMessages` ещё до первого
+ * байта. Через прокси это сотни миллисекунд на пустом месте, и заметны они
+ * ровно там, где заметнее всего: в паузе после нажатия.
+ *
+ * Кеш заведён отдельной функцией, а не спрятан внутрь `openMedia`: с
+ * состоянием на модуле тесты подсматривали бы друг за другом, а вызовы, где
+ * свежесть важнее скорости, лишились бы выбора.
+ *
+ * @param {(client: object, rawPeer: string, messageId: number) => Promise<{raw: object, info: object}>} load
+ * @param {{ttlMs?: number, limit?: number, now?: () => number}} [options]
+ */
+export function createMediaOpener(load, { ttlMs = MEDIA_INFO_TTL_MS, limit = MEDIA_INFO_LIMIT, now = Date.now } = {}) {
+    // Ключ — сам клиент: аккаунты не делят ни сессию, ни права, и общая карта
+    // означала бы чужое видео в ответ на своё. WeakMap ещё и освобождает
+    // записи вместе с отключённым аккаунтом, без всякой уборки.
+    const byClient = new WeakMap();
+
+    return async function openCached(client, rawPeer, messageId) {
+        let entries = byClient.get(client);
+        if (!entries) {
+            entries = new Map();
+            byClient.set(client, entries);
+        }
+
+        const key = `${rawPeer}\u0000${messageId}`;
+        const hit = entries.get(key);
+        if (hit && hit.until > now()) return hit.opened;
+
+        const opened = await load(client, rawPeer, messageId);
+        // Отказ сюда не доходит намеренно: запомнить его значит запереть
+        // вложение на весь срок записи — клиент повторяет запрос, а шлюз
+        // повторяет отказ, не пытаясь заново.
+        entries.delete(key);
+        entries.set(key, { opened, until: now() + ttlMs });
+        // Map хранит порядок вставки, поэтому первый ключ — самый старый.
+        while (entries.size > limit) entries.delete(entries.keys().next().value);
+        return opened;
+    };
+}
+
+/** Описание вложения с кешем — то, чем пользуется маршрут выдачи файла. */
+export const openMediaCached = createMediaOpener(openMedia);
+
+/**
  * Поток байтов файла — целиком или запрошенным диапазоном.
  *
  * Файл никогда не собирается в память целиком: видео на 200 МБ — это 200 МБ
  * RSS шлюза, общего для всех аккаунтов. Наружу уходит генератор, который
  * тянет из Telegram ровно столько, сколько успел прочитать клиент.
  *
+ * Куски запрашиваются несколькими сразу. Один `upload.getFile` за раз означает
+ * простой соединения на всё время обратного пути до дата-центра, и открытие
+ * видео упирается в задержку, а не в канал — особенно заметно через прокси.
+ *
  * @param {import("teleproto").TelegramClient} client
  * @param {{raw: object, info: object}} opened результат `openMedia`
- * @param {{range?: {start: number, end: number}|null, signal?: AbortSignal}} [options]
+ * @param {{range?: {start: number, end: number}|null, signal?: AbortSignal, partSize?: number, inflight?: number}} [options]
  * @returns {AsyncGenerator<Buffer>}
  */
-export function streamMedia(client, opened, { range = null, signal = undefined } = {}) {
+export function streamMedia(client, opened, {
+    range = null,
+    signal = undefined,
+    partSize = DOWNLOAD_PART_SIZE,
+    inflight = DOWNLOAD_INFLIGHT,
+} = {}) {
     const { raw, info } = opened;
     const plan = range
-        ? chunkPlan(range.start, range.end)
+        ? chunkPlan(range.start, range.end, partSize)
         : { offset: 0, skip: 0, length: info.size ?? Number.MAX_SAFE_INTEGER };
-    const chunks = client.iterDownload(raw, {
+
+    const parts = orderedParts((offset) => fetchPart(client, raw, offset, partSize, signal), {
         offset: plan.offset,
-        // Границу ставим по концу диапазона: без неё Range на первый килобайт
-        // выкачал бы файл до конца.
-        limit: range ? plan.skip + plan.length : undefined,
-        signal,
+        // Голова первого куска — часть плана загрузки, а не запрошенных байт:
+        // она выкачивается, но наружу не идёт.
+        length: plan.skip + plan.length,
+        partSize,
+        inflight,
     });
-    return sliceChunks(chunks, plan.skip, plan.length);
+    return sliceChunks(parts, plan.skip, plan.length);
+}
+
+/**
+ * Один кусок файла — ровно один `upload.getFile` под капотом.
+ *
+ * `limit` и `requestSize` совпадают намеренно: так `iterDownload` делает один
+ * запрос и заканчивается, а очередь кусков остаётся целиком нашей. Без `limit`
+ * он продолжил бы качать файл до конца, и параллельные куски перекрыли бы
+ * друг друга.
+ *
+ * @param {import("teleproto").TelegramClient} client
+ * @param {object} raw сообщение с вложением
+ * @param {number} offset смещение, выровненное по правилам `chunkPlan`
+ * @param {number} partSize сколько байт просить
+ * @param {AbortSignal|undefined} signal
+ * @returns {Promise<Buffer>}
+ */
+async function fetchPart(client, raw, offset, partSize, signal) {
+    const chunks = [];
+    for await (const chunk of client.iterDownload(raw, {
+        offset,
+        limit: partSize,
+        requestSize: partSize,
+        signal,
+    })) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
 }
 
 /**
@@ -351,6 +458,8 @@ export async function downloadThumb(client, rawPeer, messageId, want, { ifNoneMa
     // размытая заглушка из `stripped`, которая уже приехала в сообщении.
     if (!type) throw new ProtocolError("no_thumb", "У вложения нет превью.");
 
+    // Проверка «такой размер у вложения действительно есть»: сам объект в
+    // загрузку не уходит — см. ниже, почему.
     const size = rawMediaSizes(raw.media).find((s) => s?.type === type);
     if (!size) throw new ProtocolError("no_thumb", "У вложения нет превью.");
 
@@ -362,11 +471,22 @@ export async function downloadThumb(client, rawPeer, messageId, want, { ifNoneMa
         return { etag, mimeType: "image/jpeg", buffer: null, notModified: true };
     }
 
-    const buffer = await client.downloadMedia(raw, { thumb: size });
+    // Размер передаётся строкой типа, а не TL-объектом. Объектная ветка
+    // `getThumb` в teleproto знает только PhotoSize, PhotoCachedSize,
+    // PhotoStrippedSize и VideoSize; PhotoSizeProgressive — а это самый
+    // крупный размер у любого современного фото — не распознаётся, и загрузка
+    // молча возвращает нулевой буфер. Строковая ветка ищет размер по `type` и
+    // прогрессивный обрабатывает правильно.
+    const buffer = Buffer.from((await client.downloadMedia(raw, { thumb: type })) || []);
+    // Пустой ответ — это не превью. Отдать его двухсоткой значит выдать
+    // поломку за картинку: клиент не отличит её от «превью просто нет», а
+    // маршрут накроет пустоту недельным immutable-кешем.
+    if (buffer.length === 0) throw new ProtocolError("no_thumb", "Превью не загрузилось.");
+
     return {
         etag,
         mimeType: "image/jpeg",
-        buffer: Buffer.from(buffer || []),
+        buffer,
         notModified: false,
     };
 }

@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A ranged request could be rejected with `LIMIT_INVALID`, taking the whole process
+  with it** (`chunkPlan`). `upload.getFile` demands more than a 4096-aligned offset:
+  the requested part must lie entirely inside one megabyte of the file. Offsets were
+  aligned to 4096, so a seek into the middle of a video — `Range: bytes=5000000-`
+  became offset 4997120 — asked for bytes 4997120..5521407 and straddled the 5 MB
+  mark. Telegram answers that on the socket read loop rather than in reply to the
+  call, so it never reached the route's try/catch: it surfaced as an unhandled
+  rejection and killed the gateway for every account. Parts are now aligned to the
+  part size, which divides a megabyte, so no request can straddle one. The cost is at
+  most one extra part at the head of a range — bytes that were fetched anyway, since
+  a part is the smallest thing Telegram will hand over.
+- **An abandoned part could crash the gateway the same way** (`orderedParts`). Several
+  parts travel at once; when the client hangs up, or the first one fails, the rest are
+  dropped. Their rejections are ordinary — that is how every interrupted download
+  ends — but a rejection with no handler ends the process. The handler is now attached
+  when the request is made, not when it is dropped: the answer can arrive first.
+
+### Changed
+
+- **File streaming now pulls several parts at once** (`streamMedia`, `orderedParts`).
+  `client.iterDownload()` issues one `upload.GetFile` at a time and waits for the
+  answer before asking for the next, so throughput was capped at 512 KB per round
+  trip to the data centre — never mind how wide the pipe is. Behind a proxy a round
+  trip costs hundreds of milliseconds, and opening a video took as long as the
+  round trips, not as long as the bytes. Four parts now travel at once and are
+  handed out strictly in order (a reordered MP4 is not a slightly damaged video,
+  it is a file no player opens). Measured end to end against Telegram through a
+  proxy, the same 8.9 MB video went from 10.3 s (0.8 MB/s) to 1.6-2.9 s
+  (3.0-5.3 MB/s). Eight parts in flight was tried and is slower than four, so
+  four it is. Memory is unchanged: the queue holds four parts, not the file.
+- **The media description is cached for two minutes** (`openMediaCached`). A player
+  sends dozens of requests for one video — a probe, the start, every seek — and each
+  one paid `getEntity` plus `getMessages` before the first byte could move: measured
+  at 1.5-1.7 s per request through a proxy, gone on every repeat. The Telegram file
+  reference outlives that window by hours, so the only thing the cache can go stale
+  on is a message edited mid-playback.
+- **Six simultaneous downloads per account instead of two** (`DOWNLOADS_PER_ACCOUNT`).
+  A single player holds two connections by itself, so the third request — a seek, the
+  next frame in the viewer — waited in a queue with nothing on screen to say so.
+
+### Added
+
+- **`LOG_MEDIA_TIMING`** writes one line per file response: how long the description
+  took, when the first byte moved, and the resulting rate. The three numbers fail for
+  different reasons and are fixed in different places; without the split, "video is
+  slow" is a guess.
+- **Read boundaries on every dialog** (`normalizeDialog`): `readInboxMaxId` and
+  `readOutboxMaxId`. Telegram ships both inside the `messages.getDialogs` response
+  already, so this costs no extra call — the fields simply were not passed on. Until
+  now the only word a client ever got about the peer having read its messages was the
+  `read_outbox` event, which fires once: miss it while the socket is reconnecting, or
+  open the app on another device, and the second checkmark can never be drawn again.
+  Note that teleproto's `Dialog` wrapper lifts only `unreadCount` to the top level;
+  both boundaries live on the raw TL object at `dialog.dialog`.
+
 ## [1.1.0] - 2026-08-31
 
 ### Added

@@ -21,6 +21,17 @@ export function normalizeDialog(dialog) {
         pinned: Boolean(dialog.pinned),
         archived: Boolean(dialog.archived),
         unreadCount: dialog.unreadCount || 0,
+        // Границы прочитанного: докуда прочитаны чужие сообщения (inbox) и
+        // докуда собеседник прочитал наши (outbox). Обращение именно к
+        // `dialog.dialog`: кастомная обёртка teleproto поднимает наверх только
+        // `unreadCount`, а границы остаются в сыром TL-объекте. Данные уже
+        // приехали в ответе `messages.getDialogs` — лишнего запроса нет.
+        //
+        // Без них клиент узнаёт о прочтении только из события `read_outbox`, а
+        // оно приходит однократно: пропустил — и вторую галочку нарисовать уже
+        // нечем до конца жизни переписки.
+        readInboxMaxId: dialog.dialog?.readInboxMaxId ?? 0,
+        readOutboxMaxId: dialog.dialog?.readOutboxMaxId ?? 0,
         date: (message?.date ? message.date * 1000 : dialog.date ? dialog.date * 1000 : Date.now()),
         lastMessage: message ? {
             id: message.id,

@@ -16,9 +16,11 @@ import {
 import { sessionManager } from "../src/telegram/sessionManager.js";
 import { authStatus } from "../src/telegram/auth.js";
 import { Api } from "teleproto";
-import { normalizeMessage, sendFiles, openMedia, streamMedia, downloadThumb } from "../src/telegram/messages.js";
+import { _downloadPhoto } from "teleproto/client/downloads.js";
+import { normalizeMessage, sendFiles, openMedia, createMediaOpener, streamMedia, downloadThumb } from "../src/telegram/messages.js";
 import { describeMedia, chunkPlan, sliceChunks, createDownloadGate, pickThumbType } from "../src/telegram/media.js";
 import { parseRange, mediaResponseHead } from "../src/server/range.js";
+import { formatMediaTiming } from "../src/server/mediaTiming.js";
 import { normalizeDialog } from "../src/telegram/dialogs.js";
 import { toPlain } from "../src/telegram/serialize.js";
 import { ProtocolError } from "../src/telegram/errors.js";
@@ -168,6 +170,26 @@ test("dialogs: normalizeDialog отдаёт компактный объект", 
     assert.equal(d.title, "Канал");
     assert.equal(d.pinned, true);
     assert.equal(d.lastMessage.text, "yep");
+});
+
+test("dialogs: границы прочитанного берутся из сырого TL-объекта", () => {
+    // Обёртка teleproto поднимает наверх только unreadCount, поэтому границы
+    // читаются из dialog.dialog. Обращение к dialog.readOutboxMaxId молча
+    // давало бы undefined, и клиент остался бы без второй галочки.
+    const d = normalizeDialog({
+        id: { value: 12345 },
+        entity: { className: "User", firstName: "Анна" },
+        message: { id: 40, date: 1700000000, message: "привет" },
+        unreadCount: 3,
+        dialog: { readInboxMaxId: 37, readOutboxMaxId: 39 },
+    });
+    assert.equal(d.readInboxMaxId, 37);
+    assert.equal(d.readOutboxMaxId, 39);
+
+    // Сырого объекта может не быть — тогда сведений нет, а не «прочитано».
+    const bare = normalizeDialog({ id: { value: 12345 }, entity: {} });
+    assert.equal(bare.readInboxMaxId, 0);
+    assert.equal(bare.readOutboxMaxId, 0);
 });
 
 test("httpErrors: коды ProtocolError → HTTP-статусы, а не тотальный 500", () => {
@@ -845,9 +867,22 @@ test("range: запрос за пределами файла — 416, а не п
 test("media: план загрузки выравнивает смещение, а не режет по живому", () => {
     // upload.getFile принимает только выровненное смещение; лишние байты
     // головы отбрасываются уже у нас.
-    assert.deepEqual(chunkPlan(0, 999), { offset: 0, skip: 0, length: 1000 });
-    assert.deepEqual(chunkPlan(5000, 5999), { offset: 4096, skip: 904, length: 1000 });
-    assert.deepEqual(chunkPlan(4096, 8191), { offset: 4096, skip: 0, length: 4096 });
+    assert.deepEqual(chunkPlan(0, 999, 4096), { offset: 0, skip: 0, length: 1000 });
+    assert.deepEqual(chunkPlan(5000, 5999, 4096), { offset: 4096, skip: 904, length: 1000 });
+    assert.deepEqual(chunkPlan(4096, 8191, 4096), { offset: 4096, skip: 0, length: 4096 });
+});
+
+test("media: по умолчанию план выравнивается по куску, а не по 4096", () => {
+    // Правило upload.getFile жёстче протокольных 4096: кусок обязан целиком
+    // лежать внутри одного мегабайта файла. От смещения, кратного 4096, но не
+    // кратного размеру куска, каждый второй запрос перешагивает мегабайт.
+    const PART = 512 * 1024;
+    assert.deepEqual(chunkPlan(5000, 5999), { offset: 0, skip: 5000, length: 1000 });
+    assert.deepEqual(chunkPlan(5_000_000, 5_000_999), {
+        offset: 9 * PART,
+        skip: 5_000_000 - 9 * PART,
+        length: 1000,
+    });
 });
 
 test("media: нарезка отдаёт ровно запрошенные байты", async () => {
@@ -1000,7 +1035,150 @@ test("media: диапазон просит выровненное смещени
     const bytes = Buffer.concat(body);
     assert.equal(bytes.length, 100);
     assert.equal(bytes[0], 5000 % 251, "первый байт — ровно запрошенный");
-    assert.equal(client.calls.iterDownload[0].offset, 4096, "смещение выровнено");
+    // Ноль, а не 4096: выравнивание идёт по размеру куска, иначе запрос
+    // перешагнёт границу мегабайта — см. `chunkPlan`.
+    assert.equal(client.calls.iterDownload[0].offset, 0, "смещение выровнено по куску");
+});
+
+/**
+ * Обманка `iterDownload`, ведущая себя как настоящий: один ответ на
+ * `requestSize` байт, обрезанный концом файла и `limit`.
+ *
+ * Прежняя обманка не смотрела ни на `limit`, ни на `requestSize` и отдавала
+ * файл до конца с любого смещения. С последовательной выдачей разница не
+ * видна, а параллельная на такой обманке «проверяла» бы перекрывающиеся куски
+ * — то есть ничего.
+ *
+ * `onPart` вызывается перед выдачей куска: тестам нужно управлять тем, в каком
+ * порядке и как долго едут куски.
+ */
+function fakeIterDownload(total, { onPart } = {}) {
+    return async function* iterDownload(file, params = {}) {
+        const requestSize = params.requestSize ?? 512 * 1024;
+        const limit = params.limit ?? Infinity;
+        let sent = 0;
+        while (sent < limit) {
+            const start = Number(params.offset ?? 0) + sent;
+            const size = Math.min(requestSize, limit - sent, total - start);
+            if (size <= 0) return;
+            if (onPart) await onPart({ offset: start, size });
+            // Байт равен своему смещению по модулю 251 — так видно, какой
+            // именно участок файла доехал до клиента и в каком порядке.
+            const chunk = Buffer.alloc(size);
+            for (let i = 0; i < size; i++) chunk[i] = (start + i) % 251;
+            yield chunk;
+            sent += size;
+            // Короткий ответ Telegram означает конец файла.
+            if (size < requestSize) return;
+        }
+    };
+}
+
+/** Сообщение с видео заданного размера — для тестов выдачи файла. */
+function videoMessage(size) {
+    return {
+        id: 1,
+        media: {
+            className: "MessageMediaDocument",
+            document: { className: "Document", id: 42, mimeType: "video/mp4", size, attributes: [] },
+        },
+    };
+}
+
+/** Клиент-обманка поверх [fakeIterDownload]. */
+function streamingClient(size, options) {
+    return {
+        async getEntity() { return { className: "User", id: 1 }; },
+        async getMessages() { return [videoMessage(size)]; },
+        iterDownload: fakeIterDownload(size, options),
+    };
+}
+
+test("media: куски файла едут из Telegram одновременно", async () => {
+    // Последовательная выдача упирается не в канал, а в задержку до
+    // дата-центра: 512 КБ за круг. Через прокси круг занимает сотни
+    // миллисекунд, и видео на 50 МБ открывается минуту вместо секунд.
+    const PART = 512 * 1024;
+    let inFlight = 0;
+    let peak = 0;
+    const client = streamingClient(4 * PART, {
+        async onPart() {
+            inFlight += 1;
+            peak = Math.max(peak, inFlight);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            inFlight -= 1;
+        },
+    });
+
+    const opened = await openMedia(client, "me", 1);
+    let bytes = 0;
+    for await (const chunk of streamMedia(client, opened)) bytes += chunk.length;
+
+    assert.equal(bytes, 4 * PART);
+    assert.ok(peak >= 2, `одновременно в полёте было кусков: ${peak}`);
+});
+
+test("media: куски отдаются по порядку, даже если приехали вразнобой", async () => {
+    // Порядок здесь не украшение: перепутанные куски mp4 — это не «немного
+    // рассыпавшееся видео», а файл, который плеер не открывает вовсе.
+    const PART = 4096;
+    const TOTAL = 4 * PART;
+    const client = streamingClient(TOTAL, {
+        // Дальние куски отвечают первыми — как оно и бывает, когда запросы
+        // идут по разным соединениям.
+        onPart: ({ offset }) => new Promise((resolve) => setTimeout(resolve, TOTAL - offset)),
+    });
+
+    const opened = await openMedia(client, "me", 1);
+    const body = [];
+    for await (const chunk of streamMedia(client, opened, { partSize: PART })) body.push(chunk);
+    const bytes = Buffer.concat(body);
+
+    assert.equal(bytes.length, TOTAL);
+    const expected = Buffer.alloc(TOTAL);
+    for (let i = 0; i < TOTAL; i++) expected[i] = i % 251;
+    assert.ok(bytes.equals(expected), "байты пришли не в том порядке");
+});
+
+test("media: поток ленив — лишние куски из Telegram не запрашиваются", async () => {
+    // Клиент закрыл вкладку на десятой секунде видео. Куски в полёте уже не
+    // остановить, но запускать новые за ними — платить каналом шлюза за то,
+    // что никто не посмотрит.
+    const PART = 4096;
+    let requested = 0;
+    const client = streamingClient(100 * PART, { onPart: () => { requested += 1; } });
+
+    const opened = await openMedia(client, "me", 1);
+    let taken = 0;
+    for await (const chunk of streamMedia(client, opened, { partSize: PART })) {
+        if (++taken === 2) break;
+    }
+
+    assert.equal(taken, 2);
+    // Точное число зависит от глубины очереди; важно, что оно не растёт
+    // с размером файла — иначе это выкачивание целиком.
+    assert.ok(requested <= 8, `запрошено кусков: ${requested}`);
+});
+
+test("media: диапазон в параллельной выдаче отдаёт ровно запрошенные байты", async () => {
+    // Голова первого куска и хвост последнего лишние: плеер считает их
+    // частью кадра, и картинка рассыпается.
+    const PART = 4096;
+    const client = streamingClient(100 * PART);
+    const opened = await openMedia(client, "me", 1);
+
+    const body = [];
+    for await (const chunk of streamMedia(client, opened, {
+        range: { start: 10_000, end: 20_000 },
+        partSize: PART,
+    })) {
+        body.push(chunk);
+    }
+    const bytes = Buffer.concat(body);
+
+    assert.equal(bytes.length, 10_001);
+    assert.equal(bytes[0], 10_000 % 251, "первый байт — ровно запрошенный");
+    assert.equal(bytes[bytes.length - 1], 20_000 % 251, "последний байт — ровно запрошенный");
 });
 
 test("media: у сообщения без вложения качать нечего", async () => {
@@ -1031,12 +1209,66 @@ test("media: превью качается обрезкой, а не ориги�
     assert.equal(small.notModified, false);
     // Именно обрезка «s», а не самый большой размер: иначе превью весит
     // столько же, сколько оригинал, и смысл эндпоинта теряется.
-    assert.equal(client.calls.downloadMedia[0].thumb.type, "s");
+    assert.equal(client.calls.downloadMedia[0].thumb, "s");
     assert.ok(small.etag, "у превью есть ETag — иначе оно качается каждый раз");
 
     const medium = await downloadThumb(client, "me", 5, "m");
-    assert.equal(client.calls.downloadMedia[1].thumb.type, "x");
+    assert.equal(client.calls.downloadMedia[1].thumb, "x");
     assert.notEqual(small.etag, medium.etag, "ETag зависит от размера");
+});
+
+test("media: размер уходит в загрузку строкой, а не TL-объектом", async () => {
+    // Здесь исполняется настоящая загрузка из teleproto, а не фейк: именно
+    // объектная ветка библиотеки не знает PhotoSizeProgressive и молча
+    // возвращает нулевой буфер, а фейковый клиент это пропускал.
+    const progressive = new Api.PhotoSizeProgressive({ type: "y", w: 1280, h: 853, sizes: [10, 4096] });
+    const sizes = [
+        new Api.PhotoStrippedSize({ type: "i", bytes: Buffer.from([1, 8, 8]) }),
+        new Api.PhotoSize({ type: "s", w: 90, h: 60, size: 20 }),
+        progressive,
+    ];
+    const photo = new Api.Photo({
+        id: 777n, accessHash: 1n, fileReference: Buffer.alloc(0), date: 0, sizes, dcId: 2,
+    });
+
+    // PhotoSizeProgressive не наследует PhotoSize, и объектная ветка getThumb
+    // его не узнаёт: загрузка возвращает ноль байт вместо картинки.
+    assert.equal(progressive instanceof Api.PhotoSize, false);
+    const byObject = await _downloadPhoto(null, photo, undefined, 1, progressive);
+    assert.equal(byObject.length, 0, "объектом прогрессивный размер не качается — на этом и ломалось превью");
+
+    // Строкой тот же размер находится, и загрузка доходит до сети (клиента
+    // здесь нет, поэтому падает, — но уже не отдаёт пустоту за картинку).
+    await assert.rejects(() => _downloadPhoto(null, photo, undefined, 1, "y"));
+
+    const client = fakeClient({
+        message: { id: 5, media: { className: "MessageMediaPhoto", photo: { className: "Photo", id: 777, sizes } } },
+    });
+    await downloadThumb(client, "me", 5, "m");
+    assert.equal(client.calls.downloadMedia[0].thumb, "y", "шлюз передаёт тип строкой");
+});
+
+test("media: пустое превью не выдаётся за картинку", async () => {
+    const client = fakeClient({ message: photoMessage });
+    client.downloadMedia = async () => Buffer.alloc(0);
+    // Двухсотка с нулевой длиной неотличима для клиента от «превью просто
+    // нет», а маршрут накрыл бы её недельным immutable-кешем.
+    await assert.rejects(() => downloadThumb(client, "me", 5, "m"),
+        (err) => err instanceof ProtocolError && err.code === "no_thumb");
+});
+
+test("media: крупное превью берётся достаточным, а не самым большим", () => {
+    const thumbs = [
+        { type: "s", width: 90, height: 60 },
+        { type: "y", width: 1280, height: 853 },
+        { type: "w", width: 2560, height: 1707 },
+    ];
+    // 2560 px в пузыре не видно, а маршрут превью держит ответ в памяти
+    // целиком — в отличие от /file.
+    assert.equal(pickThumbType(thumbs, "m"), "y");
+    assert.equal(pickThumbType(thumbs, "s"), "s");
+    // Когда достаточного размера нет, берётся самый крупный из имеющихся.
+    assert.equal(pickThumbType(thumbs.slice(0, 1), "m"), "s");
 });
 
 test("media: у документа без обрезок превью не выдумывается", async () => {
@@ -1119,30 +1351,6 @@ test("range: неизвестный размер не превращается �
     assert.equal(head.headers["Content-Disposition"], undefined);
 });
 
-test("media: поток ленив — лишние чанки из Telegram не запрашиваются", () => {
-    // Клиент закрыл вкладку на десятой секунде видео: качать остаток значит
-    // платить каналом шлюза за то, что никто не посмотрит.
-    let produced = 0;
-    const client = {
-        async getEntity() { return {}; },
-        async getMessages() {
-            return [{ id: 1, media: { className: "MessageMediaDocument", document: { className: "Document", mimeType: "video/mp4", size: 10_000, attributes: [] } } }];
-        },
-        async *iterDownload() {
-            for (let i = 0; i < 100; i++) { produced++; yield Buffer.alloc(100); }
-        },
-    };
-
-    return openMedia(client, "me", 1).then(async (opened) => {
-        let taken = 0;
-        for await (const chunk of streamMedia(client, opened)) {
-            if (++taken === 3) break;
-        }
-        assert.equal(taken, 3);
-        assert.ok(produced <= 4, `запрошено чанков: ${produced}`);
-    });
-});
-
 test("media: память шлюза не зависит от размера файла", async () => {
     // Главный риск волны. Старая реализация собирала файл в Buffer целиком:
     // одно видео забирало столько RSS, сколько весило, у процесса, общего для
@@ -1153,16 +1361,7 @@ test("media: память шлюза не зависит от размера ф�
     // сразу. Полгигабайта через поток стоят десятки мегабайт; та же выдача
     // через Buffer стоила бы полгигабайта, и порог ниже неё на порядок.
     const TOTAL = 512 * 1024 * 1024;
-    const CHUNK = 512 * 1024;
-    const client = {
-        async getEntity() { return {}; },
-        async getMessages() {
-            return [{ id: 1, media: { className: "MessageMediaDocument", document: { className: "Document", mimeType: "video/mp4", size: TOTAL, attributes: [] } } }];
-        },
-        async *iterDownload() {
-            for (let sent = 0; sent < TOTAL; sent += CHUNK) yield Buffer.alloc(CHUNK);
-        },
-    };
+    const client = streamingClient(TOTAL);
 
     const opened = await openMedia(client, "me", 1);
     const before = process.memoryUsage().rss;
@@ -1510,4 +1709,152 @@ test("proxy: недоступный прокси — proxy_unreachable, а не 
         () => socket.connect(443, "149.154.167.51"),
         (err) => err.code === "proxy_unreachable",
     );
+});
+
+// ── кеш описания вложения ─────────────────────────────────────────────────────
+
+test("media: описание файла не перезапрашивается на каждый Range", async () => {
+    // Плеер шлёт за одно видео десятки запросов: проба, старт, каждая
+    // перемотка. Каждый из них платил походом в Telegram за getMessages ещё
+    // до первого байта — через прокси это сотни миллисекунд на пустом месте.
+    const client = {};
+    let loads = 0;
+    const open = createMediaOpener(async () => {
+        loads += 1;
+        return { raw: {}, info: { size: 100 } };
+    });
+
+    await open(client, "me", 5);
+    await open(client, "me", 5);
+
+    assert.equal(loads, 1);
+});
+
+test("media: описание живёт недолго — ссылка на файл в Telegram не вечна", async () => {
+    let clock = 0;
+    let loads = 0;
+    const open = createMediaOpener(async () => {
+        loads += 1;
+        return { raw: {}, info: { size: 100 } };
+    }, { ttlMs: 1000, now: () => clock });
+    const client = {};
+
+    await open(client, "me", 5);
+    clock = 999;
+    await open(client, "me", 5);
+    assert.equal(loads, 1, "внутри срока — из кеша");
+
+    clock = 1001;
+    await open(client, "me", 5);
+    assert.equal(loads, 2, "после срока — заново");
+});
+
+test("media: кеш описаний не путает сообщения и аккаунты", async () => {
+    // Один ключ на всех — это чужое видео в ответ на своё. Ошибка тихая:
+    // размер и тип совпадут, а байты приедут не те.
+    let loads = 0;
+    const open = createMediaOpener(async (client, peer, msgId) => {
+        loads += 1;
+        return { raw: {}, info: { size: msgId } };
+    });
+    const alice = {};
+    const bob = {};
+
+    assert.equal((await open(alice, "me", 5)).info.size, 5);
+    assert.equal((await open(alice, "me", 6)).info.size, 6);
+    assert.equal((await open(alice, "@other", 5)).info.size, 5);
+    assert.equal((await open(bob, "me", 5)).info.size, 5);
+
+    assert.equal(loads, 4, "каждая тройка клиент-чат-сообщение считается своей");
+});
+
+test("media: неудачное описание не запоминается", async () => {
+    // Иначе одна сетевая ошибка запирает вложение на весь срок жизни записи:
+    // клиент повторяет запрос, а шлюз повторяет отказ, не пытаясь заново.
+    let attempt = 0;
+    const open = createMediaOpener(async () => {
+        attempt += 1;
+        if (attempt === 1) throw new ProtocolError("boom", "Не вышло.");
+        return { raw: {}, info: { size: 100 } };
+    });
+    const client = {};
+
+    await assert.rejects(() => open(client, "me", 5));
+    assert.equal((await open(client, "me", 5)).info.size, 100);
+});
+
+// ── замер выдачи файла ────────────────────────────────────────────────────────
+
+test("media: строка замера показывает, где именно ушло время", async () => {
+    // Без разбивки «долго грузится» неотличимо от «долго идёт до
+    // дата-центра»: описание, ожидание первого байта и сама перекачка
+    // страдают от разных причин и чинятся по-разному.
+    const line = formatMediaTiming({
+        msgId: 42,
+        status: 206,
+        bytes: 1048576,
+        openMs: 120,
+        ttfbMs: 340,
+        totalMs: 1000,
+    });
+
+    assert.match(line, /msg=42/);
+    assert.match(line, /status=206/);
+    assert.match(line, /bytes=1048576/);
+    assert.match(line, /open=120ms/);
+    assert.match(line, /ttfb=340ms/);
+    assert.match(line, /total=1000ms/);
+    assert.match(line, /rate=1\.0MB\/s/);
+});
+
+test("media: замер без байтов не выдумывает скорость", async () => {
+    // HEAD и 416 тела не имеют, а «0.0 МБ/с» в журнале читается как поломка
+    // канала — и уводит поиск в сторону.
+    const line = formatMediaTiming({ msgId: 7, status: 416, bytes: 0, openMs: 50, ttfbMs: null, totalMs: 60 });
+
+    assert.match(line, /status=416/);
+    assert.match(line, /open=50ms/);
+    assert.ok(!line.includes("rate="), line);
+    assert.ok(!line.includes("ttfb="), line);
+});
+
+test("media: ни один запрос к Telegram не пересекает границу мегабайта", async () => {
+    // Правило upload.getFile: запрошенный кусок обязан целиком лежать внутри
+    // одного мегабайта файла. Нарушение — не пустой ответ, а LIMIT_INVALID, и
+    // прилетает он не в ответ на запрос, а в чтении сокета: до маршрута не
+    // доходит, обработчика не находит и роняет процесс целиком.
+    //
+    // Выравнивание по 4096 этого не даёт: от смещения 4096 второй кусок в
+    // 512 КБ уже перешагивает мегабайт.
+    const PART = 512 * 1024;
+    const client = {
+        async getEntity() { return {}; },
+        async getMessages() {
+            return [{
+                id: 1,
+                media: {
+                    className: "MessageMediaDocument",
+                    document: { className: "Document", mimeType: "video/mp4", size: 8 * 1024 * 1024, attributes: [] },
+                },
+            }];
+        },
+        async *iterDownload(file, params) {
+            const size = params.requestSize ?? PART;
+            const first = Number(params.offset ?? 0);
+            const last = first + size - 1;
+            if (Math.floor(first / 1048576) !== Math.floor(last / 1048576)) {
+                throw new Error(`LIMIT_INVALID: кусок ${first}..${last} пересекает границу мегабайта`);
+            }
+            if (first % 4096 !== 0) throw new Error(`OFFSET_INVALID: смещение ${first}`);
+            yield Buffer.alloc(size);
+        },
+    };
+
+    const opened = await openMedia(client, "me", 1);
+    let bytes = 0;
+    // Перемотка на середину видео: ровно тот запрос, который шлёт плеер.
+    for await (const chunk of streamMedia(client, opened, { range: { start: 5_000_000, end: 7_000_000 } })) {
+        bytes += chunk.length;
+    }
+    assert.equal(bytes, 2_000_001);
 });

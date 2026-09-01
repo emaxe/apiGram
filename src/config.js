@@ -82,6 +82,9 @@ export const config = {
     corsOrigins: parseOrigins(process.env.CORS_ORIGINS),
     // Пишет тексты сообщений на диск — по умолчанию выключено намеренно.
     logUpdates: String(process.env.LOG_UPDATES || "false") === "true",
+    // Замер выдачи файлов в журнал: описание, первый байт, скорость. Выключен
+    // по умолчанию — строка на каждый Range-запрос плеера заваливает журнал.
+    logMediaTiming: String(process.env.LOG_MEDIA_TIMING || "false") === "true",
     // Прокси для MTProto — общий на все аккаунты. null — прямое подключение.
     proxy,
     // Имя переменной, откуда взяты настройки: без него неясно, почему шлюз вообще
