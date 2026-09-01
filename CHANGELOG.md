@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] - 2026-09-01
 
 ### Fixed
 
@@ -25,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped. Their rejections are ordinary — that is how every interrupted download
   ends — but a rejection with no handler ends the process. The handler is now attached
   when the request is made, not when it is dropped: the answer can arrive first.
+- **The thumbnail of a modern photo silently came back empty** (`downloadThumb`). The size
+  was passed as a TL object, and teleproto's object branch recognizes only `PhotoSize`,
+  `PhotoCachedSize`, `PhotoStrippedSize` and `VideoSize` — while the largest size of any
+  photo taken with a current Telegram build is `PhotoSizeProgressive`, which is none of
+  them. The download returned an empty buffer, served as a `200` with no body: a client
+  saw a broken picture with no way to tell it from "no preview", and the route cached the
+  blank for a week. The size is now passed by its `type` string, which the same branch
+  resolves correctly, and an empty result raises `no_thumb` instead of pretending.
+- **`m` previews weighted up to a megabyte each** (`pickThumbType`). The "largest available"
+  size of a modern photo is its original — 2560 px — and the thumbnail route holds the
+  response in memory (unlike `/file`), so every message in a busy feed cost a megabyte of
+  gateway RSS. A bubble is capped at 320 px high, meaning under a thousand pixels on a 3x
+  screen; nothing above 1280 px is ever visible. `m` now picks the smallest preview whose
+  long side reaches 1280 px — sharp enough for the bubble, light enough for the gateway.
 
 ### Changed
 
@@ -184,6 +198,6 @@ First public release.
   second one.
 - `downloadMedia` returns the real MIME type and a `Content-Disposition` filename.
 
-[Unreleased]: https://github.com/emaxe/apiGram/compare/v1.1.0...HEAD
+[1.2.0]: https://github.com/emaxe/apiGram/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/emaxe/apiGram/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/emaxe/apiGram/releases/tag/v1.0.0

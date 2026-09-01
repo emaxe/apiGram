@@ -168,6 +168,28 @@ GET    /v1/accounts/:id/chat/:peer/messages/:msgId/thumb?size=s|m   thumbnail (E
 `:peer` is `@username`, `username`, a numeric ID (`-1001234567890`) or `me`.
 Always pass it through `encodeURIComponent`.
 
+### Media
+
+`GET …/messages/:msgId/file` streams and honours `Range`: a range yields `206`
+with `Content-Range`, a request past the end of file yields `416`. Parts are
+pulled from Telegram several at a time — behind a proxy that is several times
+faster than one round trip per part. At most six concurrent downloads per
+account; the rest queue. A dropped connection stops the download from Telegram
+too.
+
+`GET …/messages/:msgId/thumb?size=s|m` returns a JPEG crop: `s` — the smallest,
+`m` — the smallest preview sharp enough for a bubble (long side ≥ 1280 px). The
+response carries a strong `ETag`; a matching `If-None-Match` returns `304`
+without downloading from Telegram at all. Media without crops answers
+`404 no_thumb`; an instant blurry preview then lives in the message itself, in
+`media.stripped`.
+
+Every message describes its attachment: `media.{kind, mimeType, fileName, size,
+width, height, duration, waveform, thumbs, stripped, downloadable}` — sizes are
+known before the download, so a placeholder can be drawn right away. Alongside it
+came `chatId` (always marked), `groupedId` (albums), `fwdFrom`, `viaBotId` and
+`senderName`.
+
 ## WebSocket
 
 ```
