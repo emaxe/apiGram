@@ -154,13 +154,17 @@ GET    /v1/accounts/:id/chat/:peer                    chat info
 GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&reverse
 
 # Messages
-POST   /v1/accounts/:id/chat/:peer/messages           { text, replyTo? }
-POST   /v1/accounts/:id/chat/:peer/files              multipart: files[], caption, replyTo, forceDocument
-PATCH  /v1/accounts/:id/chat/:peer/messages/:msgId    { text }
+POST   /v1/accounts/:id/chat/:peer/messages           { text, replyTo?, topMsgId?, quoteText?, quoteOffset?, parseMode?, silent?, linkPreview?, schedule? }
+POST   /v1/accounts/:id/chat/:peer/files              multipart: files[], caption, replyTo, topMsgId, forceDocument, parseMode, silent
+PATCH  /v1/accounts/:id/chat/:peer/messages/:msgId    { text, parseMode?, linkPreview? }
 DELETE /v1/accounts/:id/chat/:peer/messages?ids=1,2&revoke=true
 POST   /v1/accounts/:id/chat/:peer/messages/:msgId/react   { emoji }
+POST   /v1/accounts/:id/chat/:peer/messages/:msgId/pin     { silent?, oneSide? } — pin message
+DELETE /v1/accounts/:id/chat/:peer/messages/:msgId/pin     unpin message
+DELETE /v1/accounts/:id/chat/:peer/pin?topMsgId=           unpin all messages (or in topic)
 POST   /v1/accounts/:id/chat/:peer/read               { maxId }
 POST   /v1/accounts/:id/chat/:peer/forward            { ids, fromPeer }
+GET    /v1/accounts/:id/chat/:peer/avatar?size=small|big   download avatar (ETag)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    download media (Range)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/thumb?size=s|m   thumbnail (ETag)
 ```
@@ -207,6 +211,9 @@ Events (`JSON`, every one carries `accountEvent: true`):
 | `new_message` / `edited_message` | `message` — normalized message |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |
+| `reactions` | `chatId`, `msgId`, `topMsgId`, `reactions[]` — message reactions |
+| `pinned_messages` | `chatId`, `pinned`, `messages[]` — pinned/unpinned messages |
+| `user_status` | `userId`, `status`, `online`, `wasOnline`, `expires` — online status |
 | `read_inbox` | `peerId`, `maxId` — we read the peer's messages |
 | `read_outbox` | `peerId`, `maxId` — the peer read our messages |
 | `session_closed` | `reason` — logged out, the socket closes with code `4003` |

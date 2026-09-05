@@ -153,13 +153,17 @@ GET    /v1/accounts/:id/chat/:peer                    информация о ч
 GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&reverse
 
 # Сообщения
-POST   /v1/accounts/:id/chat/:peer/messages           { text, replyTo? }
-POST   /v1/accounts/:id/chat/:peer/files              multipart: files[], caption, replyTo, forceDocument
-PATCH  /v1/accounts/:id/chat/:peer/messages/:msgId    { text }
+POST   /v1/accounts/:id/chat/:peer/messages           { text, replyTo?, topMsgId?, quoteText?, quoteOffset?, parseMode?, silent?, linkPreview?, schedule? }
+POST   /v1/accounts/:id/chat/:peer/files              multipart: files[], caption, replyTo, topMsgId, forceDocument, parseMode, silent
+PATCH  /v1/accounts/:id/chat/:peer/messages/:msgId    { text, parseMode?, linkPreview? }
 DELETE /v1/accounts/:id/chat/:peer/messages?ids=1,2&revoke=true
 POST   /v1/accounts/:id/chat/:peer/messages/:msgId/react   { emoji }
+POST   /v1/accounts/:id/chat/:peer/messages/:msgId/pin     { silent?, oneSide? } — закрепить
+DELETE /v1/accounts/:id/chat/:peer/messages/:msgId/pin     открепить сообщение
+DELETE /v1/accounts/:id/chat/:peer/pin?topMsgId=           открепить все сообщения (или в топике)
 POST   /v1/accounts/:id/chat/:peer/read               { maxId }
 POST   /v1/accounts/:id/chat/:peer/forward            { ids, fromPeer }
+GET    /v1/accounts/:id/chat/:peer/avatar?size=small|big   скачать аватар чата/пользователя (ETag)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    скачать медиа (Range)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/thumb?size=s|m   превью (ETag)
 ```
@@ -206,6 +210,9 @@ ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>
 | `new_message` / `edited_message` | `message` — нормализованное сообщение |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |
+| `reactions` | `chatId`, `msgId`, `topMsgId`, `reactions[]` — реакции на сообщении |
+| `pinned_messages` | `chatId`, `pinned`, `messages[]` — закрепление/открепление сообщений |
+| `user_status` | `userId`, `status`, `online`, `wasOnline`, `expires` — статус пользователя |
 | `read_inbox` | `peerId`, `maxId` — мы прочитали чужие сообщения |
 | `read_outbox` | `peerId`, `maxId` — собеседник прочитал наши |
 | `session_closed` | `reason` — логаут, сокет закрывается кодом `4003` |

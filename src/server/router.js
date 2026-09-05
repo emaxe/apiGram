@@ -180,8 +180,26 @@ export function buildRouter() {
     r.post("/accounts/:accountId/chat/:peer/messages", async (req, res, next) => {
         try {
             const client = await getClient(req);
-            const sent = await msg.sendMessage(client, req.params.peer, req.body?.text || "", {
-                replyTo: req.body?.replyTo,
+            const {
+                text = "",
+                replyTo,
+                topMsgId,
+                quoteText,
+                quoteOffset,
+                parseMode,
+                silent,
+                linkPreview,
+                schedule,
+            } = req.body || {};
+            const sent = await msg.sendMessage(client, req.params.peer, text, {
+                replyTo: replyTo !== undefined ? parseInt(replyTo, 10) : undefined,
+                topMsgId: topMsgId !== undefined ? parseInt(topMsgId, 10) : undefined,
+                quoteText,
+                quoteOffset: quoteOffset !== undefined ? parseInt(quoteOffset, 10) : undefined,
+                parseMode,
+                silent,
+                linkPreview,
+                schedule,
             });
             res.json(sent);
         } catch (err) { next(err); }
@@ -195,10 +213,14 @@ export function buildRouter() {
             try {
                 const client = await getClient(req);
                 const files = (req.files || []).map((f) => ({ name: f.originalname, buffer: f.buffer }));
+                const { caption = "", replyTo, topMsgId, forceDocument, parseMode, silent } = req.body || {};
                 const sent = await msg.sendFiles(client, req.params.peer, files, {
-                    caption: req.body?.caption || "",
-                    replyTo: req.body?.replyTo ? parseInt(req.body.replyTo, 10) : undefined,
-                    forceDocument: String(req.body?.forceDocument || "false") === "true",
+                    caption,
+                    replyTo: replyTo !== undefined ? parseInt(replyTo, 10) : undefined,
+                    topMsgId: topMsgId !== undefined ? parseInt(topMsgId, 10) : undefined,
+                    forceDocument: String(forceDocument || "false") === "true",
+                    parseMode,
+                    silent: String(silent || "false") === "true",
                 });
                 res.json({ sent });
             } catch (err) { next(err); }
@@ -208,8 +230,9 @@ export function buildRouter() {
     r.patch("/accounts/:accountId/chat/:peer/messages/:msgId", async (req, res, next) => {
         try {
             const client = await getClient(req);
+            const { text = "", parseMode, linkPreview } = req.body || {};
             const edited = await msg.editMessage(client, req.params.peer,
-                parseInt(req.params.msgId, 10), req.body?.text || "");
+                parseInt(req.params.msgId, 10), text, { parseMode, linkPreview });
             res.json(edited);
         } catch (err) { next(err); }
     });
@@ -239,6 +262,37 @@ export function buildRouter() {
         } catch (err) { next(err); }
     });
 
+    // Закрепление сообщения
+    r.post("/accounts/:accountId/chat/:peer/messages/:msgId/pin", async (req, res, next) => {
+        try {
+            const client = await getClient(req);
+            const { silent = false, oneSide = false } = req.body || {};
+            const result = await msg.pinMessage(client, req.params.peer,
+                parseInt(req.params.msgId, 10), { silent: Boolean(silent), oneSide: Boolean(oneSide) });
+            res.json(result);
+        } catch (err) { next(err); }
+    });
+
+    // Открепление конкретного сообщения
+    r.delete("/accounts/:accountId/chat/:peer/messages/:msgId/pin", async (req, res, next) => {
+        try {
+            const client = await getClient(req);
+            const result = await msg.unpinMessage(client, req.params.peer,
+                parseInt(req.params.msgId, 10));
+            res.json(result);
+        } catch (err) { next(err); }
+    });
+
+    // Открепление всех сообщений в чате (или топике)
+    r.delete("/accounts/:accountId/chat/:peer/pin", async (req, res, next) => {
+        try {
+            const client = await getClient(req);
+            const topMsgId = req.query.topMsgId ? parseInt(req.query.topMsgId, 10) : undefined;
+            const result = await msg.unpinMessage(client, req.params.peer, undefined, { topMsgId });
+            res.json(result);
+        } catch (err) { next(err); }
+    });
+
     // maxId = 0 означает «прочитать всё до последнего сообщения».
     r.post("/accounts/:accountId/chat/:peer/read", async (req, res, next) => {
         try {
@@ -262,7 +316,26 @@ export function buildRouter() {
     });
 
     // ── Медиа ─────────────────────────────────────────────────────
-    // Два маршрута ниже — единственные, отдающие не JSON, а байты.
+    // Маршруты ниже отдают не JSON, а байты.
+
+    // Аватар пользователя, чата или канала.
+    r.get("/accounts/:accountId/chat/:peer/avatar", async (req, res, next) => {
+        try {
+            const client = await getClient(req);
+            const size = req.query.size === "big" ? "big" : "small";
+            const avatar = await msg.downloadAvatar(client, req.params.peer, size, {
+                ifNoneMatch: req.headers["if-none-match"],
+            });
+
+            res.setHeader("ETag", avatar.etag);
+            res.setHeader("Cache-Control", "private, max-age=86400");
+            if (avatar.notModified) return res.status(304).end();
+
+            res.setHeader("Content-Type", avatar.mimeType);
+            res.setHeader("Content-Length", avatar.buffer.length);
+            res.send(avatar.buffer);
+        } catch (err) { next(err); }
+    });
 
     // Превью. Отдельный маршрут нужен ровно затем, чтобы показать вложение,
     // не выкачивая оригинал: обрезка весит килобайты против мегабайтов файла.

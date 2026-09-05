@@ -23,6 +23,7 @@ const CODE_STATUS = {
     message_not_found: 404,
     no_media: 404,
     no_thumb: 404,
+    no_avatar: 404,
     // 409 — аккаунт не в том состоянии
     not_authorized: 409,
     session_invalid: 409,
@@ -43,7 +44,7 @@ const CODE_STATUS = {
 const RAW_PATTERNS = [
     { pattern: /AUTH_KEY_UNREGISTERED|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED/i, status: 409, code: "session_invalid" },
     { pattern: /CHAT_WRITE_FORBIDDEN|USER_IS_BLOCKED|CHAT_SEND_\w+_FORBIDDEN/i, status: 403, code: "forbidden" },
-    { pattern: /MESSAGE_ID_INVALID|MESSAGE_DELETE_FORBIDDEN/i, status: 400, code: "message_invalid" },
+    { pattern: /MESSAGE_ID_INVALID|MESSAGE_DELETE_FORBIDDEN|PIN_RESTRICTED/i, status: 400, code: "message_invalid" },
     { pattern: /MESSAGE_NOT_MODIFIED|MESSAGE_EMPTY|MESSAGE_TOO_LONG/i, status: 400, code: "message_invalid" },
     { pattern: /REACTION_INVALID|REACTIONS_TOO_MANY/i, status: 400, code: "reaction_invalid" },
     { pattern: /Could not find the input entity|Cannot find any entity/i, status: 404, code: "peer_not_found" },

@@ -17,7 +17,18 @@ import { sessionManager } from "../src/telegram/sessionManager.js";
 import { authStatus } from "../src/telegram/auth.js";
 import { Api } from "teleproto";
 import { _downloadPhoto } from "teleproto/client/downloads.js";
-import { normalizeMessage, sendFiles, openMedia, createMediaOpener, streamMedia, downloadThumb } from "../src/telegram/messages.js";
+import {
+    normalizeMessage,
+    sendFiles,
+    openMedia,
+    createMediaOpener,
+    streamMedia,
+    downloadThumb,
+    sendMessage,
+    pinMessage,
+    unpinMessage,
+    downloadAvatar,
+} from "../src/telegram/messages.js";
 import { describeMedia, chunkPlan, sliceChunks, createDownloadGate, pickThumbType } from "../src/telegram/media.js";
 import { parseRange, mediaResponseHead } from "../src/server/range.js";
 import { formatMediaTiming } from "../src/server/mediaTiming.js";
@@ -1858,3 +1869,153 @@ test("media: ни один запрос к Telegram не пересекает г
     }
     assert.equal(bytes, 2_000_001);
 });
+
+test("listener: реакции превращаются в событие reactions", () => {
+    const event = classifyRawUpdate({
+        className: "UpdateMessageReactions",
+        peer: { value: 1000000002 },
+        msgId: 42,
+        topMsgId: 10,
+        reactions: {
+            results: [
+                { reaction: { emoticon: "🔥" }, count: 3, chosenOrder: 1 },
+                { reaction: { emoticon: "❤️" }, count: 1 },
+            ],
+        },
+    });
+    assert.equal(event.type, "reactions");
+    assert.equal(event.chatId, "1000000002");
+    assert.equal(event.msgId, 42);
+    assert.equal(event.topMsgId, 10);
+    assert.equal(event.reactions.length, 2);
+    assert.equal(event.reactions[0].emoticon, "🔥");
+    assert.equal(event.reactions[0].count, 3);
+    assert.equal(event.reactions[0].chosen, true);
+    assert.equal(event.reactions[1].emoticon, "❤️");
+    assert.equal(event.reactions[1].chosen, false);
+});
+
+test("listener: закрепление сообщений превращается в pinned_messages", () => {
+    const event = classifyRawUpdate({
+        className: "UpdatePinnedChannelMessages",
+        channelId: 1500000001,
+        pinned: true,
+        messages: [123, 124],
+    });
+    assert.equal(event.type, "pinned_messages");
+    assert.equal(event.chatId, "-1001500000001");
+    assert.equal(event.pinned, true);
+    assert.deepEqual(event.messages, [123, 124]);
+});
+
+test("listener: статус пользователя превращается в user_status", () => {
+    const event = classifyRawUpdate({
+        className: "UpdateUserStatus",
+        userId: 1000000002,
+        status: { className: "UserStatusOnline", expires: 1700000000 },
+    });
+    assert.equal(event.type, "user_status");
+    assert.equal(event.userId, "1000000002");
+    assert.equal(event.online, true);
+    assert.equal(event.status, "UserStatusOnline");
+    assert.equal(event.expires, 1700000000000);
+});
+
+test("errors: no_avatar мапится в 404, PIN_RESTRICTED в 400", () => {
+    const errAvatar = toHttpError(new ProtocolError("no_avatar", "У чата нет аватара."));
+    assert.equal(errAvatar.status, 404);
+    assert.equal(errAvatar.body.error, "no_avatar");
+
+    const errPin = toHttpError(new Error("RPCError: 400: PIN_RESTRICTED"));
+    assert.equal(errPin.status, 400);
+    assert.equal(errPin.body.error, "message_invalid");
+});
+
+test("messages: sendMessage передаёт parseMode, quoteText, topMsgId и silent", async () => {
+    let capturedParams = null;
+    const client = {
+        async getEntity() { return {}; },
+        async sendMessage(entity, params) {
+            capturedParams = params;
+            return { id: 1, message: "Hello", out: true, date: 1000 };
+        },
+    };
+    const res = await sendMessage(client, "me", "Hello", {
+        parseMode: "markdown",
+        replyTo: 10,
+        topMsgId: 5,
+        quoteText: "quoted part",
+        quoteOffset: 2,
+        silent: true,
+        linkPreview: false,
+    });
+    assert.equal(res.id, 1);
+    assert.equal(capturedParams.message, "Hello");
+    assert.equal(capturedParams.parseMode, "markdown");
+    assert.equal(capturedParams.replyTo, 10);
+    assert.equal(capturedParams.topMsgId, 5);
+    assert.equal(capturedParams.quoteText, "quoted part");
+    assert.equal(capturedParams.quoteOffset, 2);
+    assert.equal(capturedParams.silent, true);
+    assert.equal(capturedParams.linkPreview, false);
+});
+
+test("messages: pinMessage и unpinMessage вызывают методы клиента", async () => {
+    let pinCall = null;
+    let unpinCall = null;
+    const client = {
+        async getEntity() { return { id: 123 }; },
+        async pinMessage(entity, id, opts) {
+            pinCall = { entity, id, opts };
+        },
+        async unpinMessage(entity, id, opts) {
+            unpinCall = { entity, id, opts };
+        },
+    };
+    const resPin = await pinMessage(client, "me", 42, { silent: true, oneSide: true });
+    assert.equal(resPin.ok, true);
+    assert.equal(resPin.pinned, true);
+    assert.equal(pinCall.id, 42);
+    assert.deepEqual(pinCall.opts, { notify: false, pmOneSide: true });
+
+    const resUnpin = await unpinMessage(client, "me", 42);
+    assert.equal(resUnpin.ok, true);
+    assert.equal(resUnpin.unpinned, true);
+    assert.equal(unpinCall.id, 42);
+
+    await unpinMessage(client, "me", undefined, { topMsgId: 7 });
+    assert.equal(unpinCall.id, undefined);
+    assert.deepEqual(unpinCall.opts, { topMsgId: 7 });
+});
+
+test("messages: downloadAvatar проверяет photo, etag, 304 и возвращает буфер", async () => {
+    const client = {
+        async getEntity() {
+            return {
+                id: 123,
+                photo: { photoId: BigInt(99999) },
+            };
+        },
+        async downloadProfilePhoto(entity, { isBig }) {
+            return Buffer.from([1, 2, 3, 4]);
+        },
+    };
+
+    const avatar = await downloadAvatar(client, "me", "small");
+    assert.equal(avatar.etag, '"99999-small"');
+    assert.equal(avatar.notModified, false);
+    assert.equal(avatar.buffer.length, 4);
+
+    const cached = await downloadAvatar(client, "me", "small", { ifNoneMatch: '"99999-small"' });
+    assert.equal(cached.notModified, true);
+    assert.equal(cached.buffer, null);
+
+    const clientNoPhoto = {
+        async getEntity() { return { id: 123, photo: null }; },
+    };
+    await assert.rejects(
+        () => downloadAvatar(clientNoPhoto, "me"),
+        (err) => err instanceof ProtocolError && err.code === "no_avatar"
+    );
+});
+

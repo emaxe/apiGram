@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-09-05
+
+### Added
+
+- **Text formatting & entities support** (`parseMode`, `linkPreview`, `silent`, `schedule`)
+  in `POST /chat/:peer/messages`, `PATCH /chat/:peer/messages/:msgId`, and `POST /chat/:peer/files`.
+  Supports `markdown` (`md`), `html`, and `markdownv2` (`md2`), as well as silent delivery,
+  scheduling, and disabling link previews (`linkPreview: false`).
+- **Quote replies & topic/thread routing** (`replyTo`, `topMsgId`, `quoteText`, `quoteOffset`).
+  Allows sending messages directly to topics in forum supergroups via `topMsgId`, and quoting
+  specific text ranges when replying.
+- **Pin and unpin messages** (`pinMessage`, `unpinMessage`):
+  - `POST /v1/accounts/:id/chat/:peer/messages/:msgId/pin`: pin message with optional `silent`
+    and `oneSide` flags.
+  - `DELETE /v1/accounts/:id/chat/:peer/messages/:msgId/pin`: unpin a specific message.
+  - `DELETE /v1/accounts/:id/chat/:peer/pin?topMsgId=`: unpin all messages in the chat or topic.
+- **Chat and user avatar downloads** (`GET /v1/accounts/:id/chat/:peer/avatar?size=small|big`):
+  Streams profile/chat avatar JPEG with strong `ETag` and `Cache-Control: private, max-age=86400`.
+  Respects `If-None-Match` and yields `304 Not Modified` without downloading from Telegram.
+  Returns `404 no_avatar` when the chat or user has no photo.
+- **New WebSocket real-time events**:
+  - `reactions`: fires when message reactions are added or removed (`UpdateMessageReactions`),
+    carrying `chatId`, `msgId`, `topMsgId`, and `reactions[]` (`emoticon`, `count`, `chosen`).
+  - `pinned_messages`: fires when messages are pinned or unpinned (`UpdatePinnedMessages`,
+    `UpdatePinnedChannelMessages`), carrying `chatId`, `pinned`, and `messages[]`.
+  - `user_status`: fires when a user's presence changes (`UpdateUserStatus`), carrying
+    `userId`, `status`, `online`, `wasOnline`, and `expires`.
+- **Telegram client parity research & checklist** in `docs/report/telegram-client-parity.md`.
+
 ## [1.2.0] - 2026-09-01
 
 ### Fixed
@@ -198,6 +227,7 @@ First public release.
   second one.
 - `downloadMedia` returns the real MIME type and a `Content-Disposition` filename.
 
+[1.3.0]: https://github.com/emaxe/apiGram/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/emaxe/apiGram/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/emaxe/apiGram/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/emaxe/apiGram/releases/tag/v1.0.0

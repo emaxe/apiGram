@@ -67,6 +67,46 @@ export function classifyRawUpdate(update) {
             maxId: update.maxId,
         };
     }
+    // Реакции на сообщение
+    if (className === "UpdateMessageReactions") {
+        return {
+            accountEvent: true,
+            type: "reactions",
+            chatId: updateChatId(update),
+            msgId: update.msgId,
+            topMsgId: update.topMsgId || null,
+            reactions: Array.isArray(update.reactions?.results)
+                ? update.reactions.results.map((r) => ({
+                      emoticon: r.reaction?.emoticon || "👍",
+                      count: r.count || 1,
+                      chosen: Boolean(r.chosenOrder),
+                  }))
+                : [],
+        };
+    }
+    // Закрепление сообщений
+    if (className === "UpdatePinnedMessages" || className === "UpdatePinnedChannelMessages") {
+        return {
+            accountEvent: true,
+            type: "pinned_messages",
+            chatId: updateChatId(update),
+            pinned: Boolean(update.pinned),
+            messages: Array.isArray(update.messages) ? update.messages : [],
+        };
+    }
+    // Статус пользователя (онлайн/был недавно)
+    if (className === "UpdateUserStatus") {
+        const statusName = update.status?.className || "UserStatusEmpty";
+        return {
+            accountEvent: true,
+            type: "user_status",
+            userId: idToString(update.userId),
+            status: statusName,
+            online: statusName === "UserStatusOnline",
+            wasOnline: update.status?.wasOnline ? update.status.wasOnline * 1000 : null,
+            expires: update.status?.expires ? update.status.expires * 1000 : null,
+        };
+    }
     return null;
 }
 

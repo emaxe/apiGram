@@ -174,27 +174,114 @@ export async function fetchHistory(client, rawPeer, { limit = 40, offsetId = 0, 
  * @param {import("teleproto").TelegramClient} client
  * @param {string} rawPeer
  * @param {string} text
- * @param {object} [opts] { replyTo }
+ * @param {object} [opts]
  * @returns {Promise<object>}
  */
-export async function sendMessage(client, rawPeer, text, { replyTo } = {}) {
+export async function sendMessage(client, rawPeer, text, {
+    replyTo,
+    topMsgId,
+    quoteText,
+    quoteOffset,
+    parseMode,
+    silent,
+    linkPreview,
+    schedule,
+} = {}) {
     const entity = await resolveEntity(client, rawPeer);
     const params = { message: text };
-    if (replyTo) params.replyTo = replyTo;
+    if (replyTo !== undefined) params.replyTo = replyTo;
+    if (topMsgId !== undefined) params.topMsgId = topMsgId;
+    if (quoteText !== undefined) params.quoteText = quoteText;
+    if (quoteOffset !== undefined) params.quoteOffset = quoteOffset;
+    if (parseMode !== undefined) params.parseMode = parseMode;
+    if (silent !== undefined) params.silent = Boolean(silent);
+    if (linkPreview !== undefined) params.linkPreview = Boolean(linkPreview);
+    if (schedule !== undefined) params.schedule = schedule;
     const sent = await client.sendMessage(entity, params);
     return normalizeMessage(sent);
 }
 
-/** @param {import("teleproto").TelegramClient} client @param {string} rawPeer @param {number} id @param {string} text */
-export async function editMessage(client, rawPeer, id, text) {
+/**
+ * Редактирование сообщения.
+ * @param {import("teleproto").TelegramClient} client
+ * @param {string} rawPeer
+ * @param {number} id
+ * @param {string} text
+ * @param {object} [opts]
+ */
+export async function editMessage(client, rawPeer, id, text, {
+    parseMode,
+    linkPreview,
+} = {}) {
     const entity = await resolveEntity(client, rawPeer);
-    return normalizeMessage(await client.editMessage(entity, { message: id, text }));
+    const params = { message: id, text };
+    if (parseMode !== undefined) params.parseMode = parseMode;
+    if (linkPreview !== undefined) params.linkPreview = Boolean(linkPreview);
+    return normalizeMessage(await client.editMessage(entity, params));
 }
 
 /** @param {import("teleproto").TelegramClient} client @param {string} rawPeer @param {Array<number>} ids @param {{revoke?:boolean}} [opts] */
 export async function deleteMessages(client, rawPeer, ids, { revoke = true } = {}) {
     const entity = await resolveEntity(client, rawPeer);
     return await client.deleteMessages(entity, ids, { revoke });
+}
+
+/**
+ * Закрепляет сообщение в чате.
+ * @param {import("teleproto").TelegramClient} client
+ * @param {string} rawPeer
+ * @param {number} messageId
+ * @param {object} [opts] { silent=false, oneSide=false }
+ */
+export async function pinMessage(client, rawPeer, messageId, { silent = false, oneSide = false } = {}) {
+    const entity = await resolveEntity(client, rawPeer);
+    await client.pinMessage(entity, messageId, { notify: !silent, pmOneSide: oneSide });
+    return { ok: true, id: messageId, pinned: true };
+}
+
+/**
+ * Открепляет конкретное сообщение или все сообщения в чате.
+ * @param {import("teleproto").TelegramClient} client
+ * @param {string} rawPeer
+ * @param {number} [messageId] если не указан, открепляются все
+ * @param {object} [opts] { topMsgId }
+ */
+export async function unpinMessage(client, rawPeer, messageId, { topMsgId } = {}) {
+    const entity = await resolveEntity(client, rawPeer);
+    await client.unpinMessage(entity, messageId, { topMsgId });
+    return { ok: true, id: messageId ?? null, unpinned: true };
+}
+
+/**
+ * Скачивает аватар пользователя, чата или канала.
+ * @param {import("teleproto").TelegramClient} client
+ * @param {string} rawPeer
+ * @param {string} [size="small"] "small" | "big"
+ * @param {object} [opts] { ifNoneMatch }
+ * @returns {Promise<{etag: string, mimeType: string, buffer: Buffer|null, notModified: boolean}>}
+ */
+export async function downloadAvatar(client, rawPeer, size = "small", { ifNoneMatch } = {}) {
+    const entity = await resolveEntity(client, rawPeer);
+    const photo = entity?.photo;
+    const photoId = photo?.photoId ?? photo?.id;
+    if (!photo || !photoId) {
+        throw new ProtocolError("no_avatar", "У чата или пользователя нет аватара.");
+    }
+    const isBig = size === "big";
+    const etag = `"${idToString(photoId)}-${isBig ? "big" : "small"}"`;
+    if (ifNoneMatch && ifNoneMatch === etag) {
+        return { etag, mimeType: "image/jpeg", buffer: null, notModified: true };
+    }
+    const buffer = Buffer.from(await client.downloadProfilePhoto(entity, { isBig }) || []);
+    if (buffer.length === 0) {
+        throw new ProtocolError("no_avatar", "Аватар не найден или не загрузился.");
+    }
+    return {
+        etag,
+        mimeType: "image/jpeg",
+        buffer,
+        notModified: false,
+    };
 }
 
 /** Максимум вложений в альбоме. */
@@ -221,10 +308,17 @@ function toUploadable(file) {
  * @param {import("teleproto").TelegramClient} client
  * @param {string} rawPeer
  * @param {string|Buffer|{name?: string, buffer: Buffer}|Array<string|Buffer|{name?: string, buffer: Buffer}>} files
- * @param {object} [opts] { caption, replyTo, forceDocument }
+ * @param {object} [opts] { caption, replyTo, topMsgId, forceDocument, parseMode, silent }
  * @returns {Promise<Array<object>>}
  */
-export async function sendFiles(client, rawPeer, files, { caption = "", replyTo, forceDocument = false } = {}) {
+export async function sendFiles(client, rawPeer, files, {
+    caption = "",
+    replyTo,
+    topMsgId,
+    forceDocument = false,
+    parseMode,
+    silent,
+} = {}) {
     const list = (Array.isArray(files) ? files : [files]).filter(Boolean);
     if (list.length === 0) throw new ProtocolError("no_files", "Не указан ни один файл.");
     if (list.length > ALBUM_LIMIT) {
@@ -237,7 +331,10 @@ export async function sendFiles(client, rawPeer, files, { caption = "", replyTo,
         caption,
         forceDocument,
     };
-    if (replyTo) params.replyTo = replyTo;
+    if (replyTo !== undefined) params.replyTo = replyTo;
+    if (topMsgId !== undefined) params.topMsgId = topMsgId;
+    if (parseMode !== undefined) params.parseMode = parseMode;
+    if (silent !== undefined) params.silent = Boolean(silent);
     const sent = await client.sendFile(entity, params);
     return (Array.isArray(sent) ? sent : [sent]).filter(Boolean).map(normalizeMessage);
 }
