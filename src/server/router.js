@@ -18,6 +18,7 @@ import { createDownloadGate } from "../telegram/media.js";
 import { parseRange, mediaResponseHead } from "./range.js";
 import { formatMediaTiming } from "./mediaTiming.js";
 import { config } from "../config.js";
+import { handleMcpPost, handleMcpGetOrDelete } from "./mcpRoute.js";
 
 // Пропускник загрузок общий на процесс: ограничение считается по аккаунту,
 // а не по запросу, и пересоздавать его на каждый роутер значило бы снять его.
@@ -448,6 +449,19 @@ export function buildRouter() {
             await prof.setStatus(await getClient(req), online);
             res.json({ ok: true, online });
         } catch (err) { next(err); }
+    });
+
+    // ── MCP ───────────────────────────────────────────────────────
+    // AI-агенты получают тот же набор операций через протокол MCP. Сессия
+    // привязана к одному accountId — токен и правила доступа те же, что и у REST.
+    r.post("/accounts/:accountId/mcp", (req, res, next) => {
+        handleMcpPost(req, res).catch(next);
+    });
+    r.get("/accounts/:accountId/mcp", (req, res, next) => {
+        handleMcpGetOrDelete(req, res).catch(next);
+    });
+    r.delete("/accounts/:accountId/mcp", (req, res, next) => {
+        handleMcpGetOrDelete(req, res).catch(next);
     });
 
     return r;

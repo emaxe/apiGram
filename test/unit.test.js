@@ -2370,3 +2370,98 @@ test("mcp/media: download_file отдаёт ссылку, а не байты", a
     }
 });
 
+// ── MCP: HTTP-маршрут и жизненный цикл сессии ───────────────────────────────
+
+test("mcp: initialize → tools/list → tools/call проходят через /v1/accounts/:id/mcp", async () => {
+    const account = createAccount("mcp-int");
+    const server = createHttpApp().listen(0, "127.0.0.1");
+    await new Promise((resolve) => server.once("listening", resolve));
+    const { port } = server.address();
+    const base = `http://127.0.0.1:${port}`;
+    const mcpUrl = `${base}/v1/accounts/${account.accountId}/mcp`;
+    const headers = {
+        Authorization: `Bearer ${account.apiToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+    };
+    // Объявлена до try: нужна и внутри него, и в finally для аккуратного закрытия сессии.
+    let sessionId;
+
+    try {
+        const initRes = await fetch(mcpUrl, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "initialize",
+                params: {
+                    protocolVersion: "2025-06-18",
+                    capabilities: {},
+                    clientInfo: { name: "test-client", version: "1.0.0" },
+                },
+            }),
+        });
+        assert.equal(initRes.status, 200);
+        sessionId = initRes.headers.get("mcp-session-id");
+        assert.ok(sessionId);
+        const initBody = await initRes.json();
+        assert.equal(initBody.result.serverInfo.name, "apigram");
+
+        const sessionHeaders = { ...headers, "mcp-session-id": sessionId };
+
+        await fetch(mcpUrl, {
+            method: "POST",
+            headers: sessionHeaders,
+            body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+        });
+
+        const listRes = await fetch(mcpUrl, {
+            method: "POST",
+            headers: sessionHeaders,
+            body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+        });
+        const listBody = await listRes.json();
+        const toolNames = listBody.result.tools.map((t) => t.name).sort();
+        assert.deepEqual(toolNames, [
+            "delete_messages", "download_file", "edit_message", "forward_messages",
+            "get_chat", "get_history", "list_dialogs", "mark_as_read",
+            "react", "send_files", "send_message",
+        ]);
+
+        // Аккаунт не авторизован в Telegram — ошибка должна прийти как isError
+        // внутри результата инструмента, а не как транспортный сбой.
+        const callRes = await fetch(mcpUrl, {
+            method: "POST",
+            headers: sessionHeaders,
+            body: JSON.stringify({
+                jsonrpc: "2.0", id: 3, method: "tools/call",
+                params: { name: "list_dialogs", arguments: {} },
+            }),
+        });
+        const callBody = await callRes.json();
+        assert.equal(callBody.result.isError, true);
+        const errorBody = JSON.parse(callBody.result.content[0].text);
+        assert.equal(errorBody.error, "not_authorized");
+
+        // Сессия другого токена не должна быть видна по угаданному session id.
+        const otherAccount = createAccount("mcp-int-other");
+        try {
+            const foreignRes = await fetch(mcpUrl.replace(account.accountId, otherAccount.accountId), {
+                method: "POST",
+                headers: { ...headers, Authorization: `Bearer ${otherAccount.apiToken}`, "mcp-session-id": sessionId },
+                body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list" }),
+            });
+            assert.equal(foreignRes.status, 404);
+        } finally {
+            deleteAccount(otherAccount.accountId);
+        }
+    } finally {
+        if (sessionId) {
+            await fetch(mcpUrl, { method: "DELETE", headers: { ...headers, "mcp-session-id": sessionId } }).catch(() => {});
+        }
+        deleteAccount(account.accountId);
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
