@@ -20,7 +20,7 @@ Multi-user Telegram API gateway (MTProto) — REST + WebSocket. Один Node-п
 | `src/storage/` | Атомарная запись JSON и JSONL с ротацией |
 | `scripts/smoke.mjs` | Сквозная проверка на живом аккаунте |
 | `test/unit.test.js` | Юнит-тесты (`node --test`) |
-| `.agents/skills/` | Скиллы для AI-агентов (напр. `apigram-mcp` — как подключиться к MCP-серверу шлюза); `.claude/skills` — симлинк сюда |
+| `skills/` | Скиллы для AI-агентов (напр. `apigram-mcp` — как подключиться к MCP-серверу шлюза). Каноническая локация для `npx skills add` (vercel-labs/skills, он же skills.sh); `.agents/skills` и `.claude/skills` — симлинки сюда |
 
 ## Команды
 
