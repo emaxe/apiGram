@@ -16,6 +16,7 @@ Multi-user Telegram API gateway (MTProto) — REST + WebSocket. Один Node-п
 | `src/server/` | HTTP-слой: Express-приложение, роутер, Bearer-проверка, маппинг ошибок, WS |
 | `src/telegram/` | Протокольный слой: клиент, пул сессий, авторизация, сообщения, диалоги, профиль, слушатель обновлений |
 | `src/registry/` | Реестр аккаунтов поверх `data/accounts.json` |
+| `src/mcp/` | MCP-сервер для AI-агентов: tools поверх `src/telegram/*`, HTTP-жизненный цикл сессии в `src/server/mcpRoute.js` |
 | `src/storage/` | Атомарная запись JSON и JSONL с ротацией |
 | `scripts/smoke.mjs` | Сквозная проверка на живом аккаунте |
 | `test/unit.test.js` | Юнит-тесты (`node --test`) |

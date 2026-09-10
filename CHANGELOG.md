@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP-сервер для AI-агентов** (`src/mcp/`, `src/server/mcpRoute.js`): Streamable HTTP
+  на `POST/GET/DELETE /v1/accounts/:accountId/mcp`, внутри уже существующей
+  bearer-мидлвары — MCP-сессия привязана к одному аккаунту тем же токеном, что и REST.
+  Набор tools: `list_dialogs`, `get_chat`, `get_history`, `send_message`, `edit_message`,
+  `delete_messages`, `mark_as_read`, `react`, `forward_messages`, `send_files`,
+  `download_file` — тонкие обёртки над `src/telegram/*`, ошибки инструментов приходят как
+  `isError: true` с тем же телом, что и в REST (`toHttpError`). `download_file` отдаёт
+  ссылку и Bearer-токен, а не байты — стриминг с Range уже есть в REST.
 - **Персистентность pts/qts/seq между рестартами** (`src/telegram/updateState.js`,
   `src/telegram/sessionManager.js`): состояние обновлений (`pts`, `qts`, `date`, `seq`)
   сохраняется в `data/updateState.json` с debounce ~5 c и безусловным flush при

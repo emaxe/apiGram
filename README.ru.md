@@ -226,6 +226,37 @@ ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>
 Коды закрытия: `4001` — неверный токен или аккаунт не авторизован,
 `4002` — сессия недоступна, `4003` — логаут.
 
+## MCP
+
+```
+POST/GET/DELETE http://127.0.0.1:3111/v1/accounts/<id>/mcp
+Authorization: Bearer <apiToken>
+```
+
+Streamable HTTP эндпоинт для AI-агентов (MCP). Тот же bearer-токен и та же
+привязка к аккаунту, что и у REST — одна MCP-сессия всегда работает от имени
+одного аккаунта.
+
+Tools:
+
+| Tool | Описание |
+|---|---|
+| `list_dialogs` | Список чатов: `limit`, `archived`, `query` |
+| `get_chat` | Карточка чата/пользователя по `peer` |
+| `get_history` | История сообщений: `peer`, `limit`, `offsetId`, `reverse` |
+| `send_message` | Отправка текста: `peer`, `text`, `replyTo`, `parseMode`, `silent`, `linkPreview` |
+| `edit_message` | Редактирование текста: `peer`, `messageId`, `text` |
+| `delete_messages` | Удаление: `peer`, `ids[]`, `revoke` |
+| `mark_as_read` | Отметка прочитанным до `maxId` (0 — всё) |
+| `react` | Эмодзи-реакция: `peer`, `messageId`, `emoji` |
+| `forward_messages` | Пересылка: `toPeer`, `ids[]`, `fromPeer` |
+| `send_files` | Отправка до 10 файлов как base64: `peer`, `files[]`, `caption` |
+| `download_file` | Метаданные и ссылка на REST-скачивание вложения — не сами байты |
+
+`download_file` никогда не отдаёт байты внутрь MCP-ответа — только ссылку на
+уже существующий `GET .../chat/:peer/messages/:msgId/file` с тем же
+bearer-токеном: стриминг с поддержкой Range там уже реализован.
+
 ## Ошибки
 
 `{ error, message, step?, hint?, seconds? }`.

@@ -227,6 +227,36 @@ learn what the peer has already read.
 Close codes: `4001` — bad token or the account is not authorized,
 `4002` — session unavailable, `4003` — logged out.
 
+## MCP
+
+```
+POST/GET/DELETE http://127.0.0.1:3111/v1/accounts/<id>/mcp
+Authorization: Bearer <apiToken>
+```
+
+Streamable HTTP endpoint for AI agents (MCP). Same bearer token and account
+scoping as the REST API — one MCP session always acts as one account.
+
+Tools:
+
+| Tool | Description |
+|---|---|
+| `list_dialogs` | List chats: `limit`, `archived`, `query` |
+| `get_chat` | Chat/user card by `peer` |
+| `get_history` | Message history: `peer`, `limit`, `offsetId`, `reverse` |
+| `send_message` | Send text: `peer`, `text`, `replyTo`, `parseMode`, `silent`, `linkPreview` |
+| `edit_message` | Edit text: `peer`, `messageId`, `text` |
+| `delete_messages` | Delete: `peer`, `ids[]`, `revoke` |
+| `mark_as_read` | Mark read up to `maxId` (0 = everything) |
+| `react` | Emoji reaction: `peer`, `messageId`, `emoji` |
+| `forward_messages` | Forward: `toPeer`, `ids[]`, `fromPeer` |
+| `send_files` | Send up to 10 files as base64: `peer`, `files[]`, `caption` |
+| `download_file` | Metadata + a REST download link for a message's attachment — not the bytes |
+
+`download_file` never returns raw bytes inside the MCP response — it points
+back at the existing `GET .../chat/:peer/messages/:msgId/file` endpoint with
+the same bearer token, since Range-based streaming is already implemented there.
+
 ## Errors
 
 `{ error, message, step?, hint?, seconds? }`.
