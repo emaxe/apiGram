@@ -46,6 +46,7 @@ import { toHttpError } from "../src/server/httpErrors.js";
 import { withToolError } from "../src/mcp/toolError.js";
 import { registerDialogTools } from "../src/mcp/tools/dialogs.js";
 import { registerMessageTools } from "../src/mcp/tools/messages.js";
+import { registerMediaTools } from "../src/mcp/tools/media.js";
 import { parseOrigins, isOriginAllowed, corsMiddleware } from "../src/server/cors.js";
 import { classifyRawUpdate, deletedMessagesEvent } from "../src/telegram/listener.js";
 import { DeletedMessage } from "teleproto/events/index.js";
@@ -2295,6 +2296,74 @@ test("mcp/messages: forward_messages пересылает сообщения", a
         const result = await cb({ toPeer: "ada", ids: [10] });
         const body = JSON.parse(result.content[0].text);
         assert.equal(body.sent[0].id, 900);
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+// ── MCP: файлы ────────────────────────────────────────────────────────────────
+
+test("mcp/media: send_files декодирует base64 и отправляет файл", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async sendFile(entity, params) { return { id: 20, message: params.caption, date: 1730000000, out: true }; },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMediaTools(server, account, "http://127.0.0.1:3111");
+        const { cb } = server.tools.get("send_files");
+        const result = await cb({
+            peer: "ada",
+            files: [{ name: "note.txt", base64: Buffer.from("hello").toString("base64") }],
+            caption: "cap",
+        });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.sent[0].id, 20);
+        assert.equal(body.sent[0].text, "cap");
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/media: download_file отдаёт ссылку, а не байты", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async getMessages() {
+                return [{
+                    id: 5,
+                    media: {
+                        className: "MessageMediaDocument",
+                        document: {
+                            className: "Document",
+                            mimeType: "text/plain",
+                            size: 42,
+                            attributes: [{ className: "DocumentAttributeFilename", fileName: "report.txt" }],
+                        },
+                    },
+                }];
+            },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMediaTools(server, account, "http://127.0.0.1:3111");
+        const { cb } = server.tools.get("download_file");
+        const result = await cb({ peer: "ada", messageId: 5 });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.fileName, "report.txt");
+        assert.equal(body.mimeType, "text/plain");
+        assert.equal(body.size, 42);
+        assert.equal(body.url, `http://127.0.0.1:3111/v1/accounts/${account.accountId}/chat/ada/messages/5/file`);
+        assert.equal(body.authorization, `Bearer ${account.apiToken}`);
     } finally {
         sessionManager.clients.delete(account.accountId);
         deleteAccount(account.accountId);
