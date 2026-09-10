@@ -21,6 +21,7 @@
 | `sendFile(peer, {name, buffer})` | простой объект не принимается, падает с «Cannot use [object Object] as file» | заворачивать в `CustomFile` |
 | `sendReadAcknowledge()` | метода не существует | `markAsRead(entity, maxId)` |
 | `proxy: { type: "http", … }` | поддержаны только SOCKS4/5 и MTProxy; `PromisedNetSockets` бросает «Invalid sockets params» без `socksType` | свой транспорт в `src/telegram/proxySocket.js` через опцию `networkSocket` |
+| `client.updates.refreshFromState(state)` — восстановить pts/qts/seq/date после рестарта | метода нет в публичном `client.updates`; есть только `client.updateManager.refreshFromState(state)` — обычный метод `UpdateManager`, доступ напрямую | вызывать `client.updateManager.refreshFromState(state)` **до** `client.connect()` — `ensureState()` внутри `_updateLoop` синхронно проверяет `if (this.state) return` до первого await и иначе затрёт состояние свежим с сервера |
 
 `src/telegram/proxySocket.js` наследуется от `PromisedNetSockets` и опирается на его
 внутренние поля (`chunks`, `headOffset`, `available`, `canRead`, `resolveRead`, `closed`,

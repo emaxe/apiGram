@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Персистентность pts/qts/seq между рестартами** (`src/telegram/updateState.js`,
+  `src/telegram/sessionManager.js`): состояние обновлений (`pts`, `qts`, `date`, `seq`)
+  сохраняется в `data/updateState.json` с debounce ~5 c и безусловным flush при
+  остановке/логауте аккаунта. При следующем подключении оно подсевается в `teleproto`
+  до `client.connect()` (`updateManager.refreshFromState`), а сразу после регистрации
+  слушателя обновлений шлюз явно вызывает `client.updates.catchUp()` — пропущенные за
+  время простоя личные сообщения и сообщения обычных групп дозаливаются через
+  `updates.getDifference` и проходят тот же путь, что и живые апдейты, без отдельного
+  кода доставки. Супергруппы и каналы используют отдельное pts-пространство
+  (`updates.getChannelDifference`) и в этот проход не входят — см.
+  `docs/report/pts-sync-design.md`.
+
 ## [1.3.0] - 2026-09-05
 
 ### Added
