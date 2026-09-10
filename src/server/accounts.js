@@ -63,7 +63,13 @@ export function makeAccount(name) {
 export function removeAccount(accountId, token) {
     if (!getAccount(accountId, token)) return false;
     const removed = delAccount(accountId);
-    if (removed) deleteUpdateState(accountId);
+    if (removed) {
+        try {
+            deleteUpdateState(accountId);
+        } catch (err) {
+            console.error(`apiGram: не удалось удалить update state для ${accountId}: ${err?.message || err}`);
+        }
+    }
     return removed;
 }
 

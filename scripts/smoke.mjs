@@ -252,14 +252,26 @@ async function main() {
     if (process.env.SMOKE_RESTART === "1") {
         head("Докачка после рестарта (pts sync)");
         console.log("Перезапустите сервер в другом терминале: Ctrl+C, затем npm start.");
+        console.log("Для этого шага сервер нужно поднять с LOG_UPDATES=true — иначе проверять докачку не по чему");
+        console.log("(GET /history всегда покажет сообщение независимо от того, сработала докачка или нет).");
         await rl.question("Когда сервер снова поднят и слушает порт, нажмите Enter... ");
         console.log("Теперь, ПОКА не нажали Enter ниже, напишите себе в «Избранное» с телефона.");
         await rl.question("Сообщение отправлено — нажмите Enter, чтобы шлюз переподключился и дозалил его... ");
-        await step("докачанное сообщение видно в истории", async () => {
-            const h = await api("GET", `${me}/history?limit=5`, auth);
-            const found = h.messages.some((m) => m.date && Date.now() / 1000 - m.date < 300);
-            if (!found) throw new Error("свежего (< 5 мин) сообщения в истории не нашлось");
-            return `сообщений в истории: ${h.messages.length}`;
+        await step("докачанный new_message попал в data/updates.jsonl", async () => {
+            const updatesPath = path.join(process.cwd(), "data", "updates.jsonl");
+            if (!fs.existsSync(updatesPath)) {
+                throw new Error(`${updatesPath} не найден — перезапустите сервер с LOG_UPDATES=true`);
+            }
+            const lines = fs.readFileSync(updatesPath, "utf8").split("\n").filter(Boolean);
+            const found = lines.some((line) => {
+                let entry;
+                try { entry = JSON.parse(line); } catch { return false; }
+                return entry.event?.type === "new_message" && Date.now() - entry.ts < 5 * 60 * 1000;
+            });
+            if (!found) {
+                throw new Error("свежей (< 5 мин) записи new_message в data/updates.jsonl не нашлось — убедитесь, что сервер запущен с LOG_UPDATES=true");
+            }
+            return `строк в логе: ${lines.length}`;
         });
     }
 

@@ -106,6 +106,10 @@ class SessionManager {
             const stopListener = startAccountListener(client, this.channel(account.accountId));
             // Слушатель уже стоит — теперь можно безопасно дозалить пропущенное:
             // довылившиеся апдейты пройдут через него, как обычные живые.
+            // Намеренно await, а не fire-and-forget: getClient() возвращает клиент
+            // только после докачки, так что первый запрос после долгого простоя может
+            // выполняться дольше обычного (getDifference гоняется в цикле без таймаута) —
+            // цена за то, что ответ на первый запрос гарантированно видит уже дозалитое.
             if (persisted) {
                 try {
                     await client.updates.catchUp();
