@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { buildClient, apiCredentials } from "./client.js";
 import { ProtocolError } from "./errors.js";
+import { loadUpdateState, saveUpdateState, deleteUpdateState, shouldFlush } from "./updateState.js";
 
 /**
  * Пул TelegramClient по аккаунтам. Авторизованные клиенты живут в `clients`
@@ -84,6 +85,14 @@ class SessionManager {
     async #connectClient(account) {
         const client = buildClient(account.sessionString);
         try {
+            // Подсеваем персистентный pts/qts/seq/date ДО connect(): _updateLoop,
+            // который тот запускает, синхронно проверяет `if (this.state) return`
+            // внутри ensureState() до первого await — если состояние уже задано,
+            // teleproto не станет затирать его свежим с сервера.
+            const persisted = loadUpdateState(account.accountId);
+            if (persisted) {
+                client.updateManager.refreshFromState(persisted);
+            }
             await client.connect();
             const authorized = await client.isUserAuthorized();
             if (!authorized) {
@@ -95,13 +104,53 @@ class SessionManager {
             }
             const { startAccountListener } = await import("./listener.js");
             const stopListener = startAccountListener(client, this.channel(account.accountId));
-            this.clients.set(account.accountId, { client, stopListener });
+            // Слушатель уже стоит — теперь можно безопасно дозалить пропущенное:
+            // довылившиеся апдейты пройдут через него, как обычные живые.
+            if (persisted) {
+                try {
+                    await client.updates.catchUp();
+                } catch (err) {
+                    console.error(`apiGram: докачка пропущенных обновлений не удалась для ${account.accountId}: ${err?.message || err}`);
+                }
+            }
+            const { stop: stopStatePersistence, flush: flushUpdateState } =
+                this.#attachUpdateStatePersistence(client, account.accountId);
+            this.clients.set(account.accountId, { client, stopListener, stopStatePersistence, flushUpdateState });
             return client;
         } catch (err) {
             await client.disconnect().catch(() => {});
             await client.destroy?.().catch(() => {});
             throw err;
         }
+    }
+
+    /**
+     * Подписывает клиента на сохранение pts/qts/seq/date на диск: не чаще
+     * STATE_FLUSH_INTERVAL_MS при живом потоке апдейтов, плюс безусловный
+     * flush() для явного вызова из #teardown. Без этого состояние живёт
+     * только в памяти teleproto и обнуляется на каждом рестарте — см.
+     * docs/report/pts-sync-design.md.
+     * @param {import("teleproto").TelegramClient} client
+     * @param {string} accountId
+     * @returns {{ stop: () => void, flush: () => void }}
+     */
+    #attachUpdateStatePersistence(client, accountId) {
+        let lastSavedAt = 0;
+        const flush = () => {
+            const state = client.updates.state;
+            if (!state) return;
+            try {
+                saveUpdateState(accountId, state);
+                lastSavedAt = Date.now();
+            } catch (err) {
+                console.error(`apiGram: не удалось сохранить update state для ${accountId}: ${err?.message || err}`);
+            }
+        };
+        const stop = client.updates.use(async (update, next) => {
+            await next();
+            if (shouldFlush(lastSavedAt, Date.now())) flush();
+        });
+        return { stop, flush };
     }
 
     /**
@@ -156,8 +205,14 @@ class SessionManager {
         const { startAccountListener } = await import("./listener.js");
         const previous = this.clients.get(account.accountId);
         previous?.stopListener?.();
+        previous?.stopStatePersistence?.();
         const stopListener = startAccountListener(client, this.channel(account.accountId));
-        this.clients.set(account.accountId, { client, stopListener });
+        // Свежий логин — персистентного состояния для него ещё нет (deleteUpdateState
+        // стирает запись при logout), поэтому catchUp() не нужен — только запускаем
+        // сохранение состояния на будущее.
+        const { stop: stopStatePersistence, flush: flushUpdateState } =
+            this.#attachUpdateStatePersistence(client, account.accountId);
+        this.clients.set(account.accountId, { client, stopListener, stopStatePersistence, flushUpdateState });
         const pending = this.pendingAuth.get(account.accountId);
         if (pending && pending.client === client) {
             this.#adoptPending(account.accountId);
@@ -176,6 +231,9 @@ class SessionManager {
      */
     async release(accountId) {
         await this.#teardown(accountId, { logOut: true });
+        // Сессия отозвана — состояние от неё больше не действительно, и его
+        // персистентный снимок (см. #teardown) не должен пережить logout.
+        deleteUpdateState(accountId);
         this.channel(accountId).emit("account_event", {
             accountEvent: true,
             type: "session_closed",
@@ -210,6 +268,10 @@ class SessionManager {
         if (!entry) return;
         this.clients.delete(accountId);
         entry.stopListener?.();
+        entry.stopStatePersistence?.();
+        // Последний снимок состояния перед отключением — иначе теряем до
+        // STATE_FLUSH_INTERVAL_MS свежих апдейтов между дебаунсами.
+        entry.flushUpdateState?.();
         if (logOut) {
             await Promise.resolve(entry.client.logOut?.()).catch(() => {});
         }
