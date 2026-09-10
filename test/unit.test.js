@@ -43,6 +43,7 @@ import { normalizeDialog } from "../src/telegram/dialogs.js";
 import { toPlain } from "../src/telegram/serialize.js";
 import { ProtocolError } from "../src/telegram/errors.js";
 import { toHttpError } from "../src/server/httpErrors.js";
+import { withToolError } from "../src/mcp/toolError.js";
 import { parseOrigins, isOriginAllowed, corsMiddleware } from "../src/server/cors.js";
 import { classifyRawUpdate, deletedMessagesEvent } from "../src/telegram/listener.js";
 import { DeletedMessage } from "teleproto/events/index.js";
@@ -2058,5 +2059,24 @@ test("updateState: shouldFlush — не чаще одного раза за ок
     assert.equal(shouldFlush(0, 1000, STATE_FLUSH_INTERVAL_MS), true); // никогда не сохраняли
     assert.equal(shouldFlush(1000, 1000 + STATE_FLUSH_INTERVAL_MS - 1, STATE_FLUSH_INTERVAL_MS), false);
     assert.equal(shouldFlush(1000, 1000 + STATE_FLUSH_INTERVAL_MS, STATE_FLUSH_INTERVAL_MS), true);
+});
+
+// ── MCP: обёртка ошибок инструментов ────────────────────────────────────────
+
+test("mcp/toolError: успешный результат проходит без изменений", async () => {
+    const wrapped = withToolError(async () => ({ content: [{ type: "text", text: "ok" }] }));
+    const result = await wrapped({});
+    assert.deepEqual(result, { content: [{ type: "text", text: "ok" }] });
+});
+
+test("mcp/toolError: ProtocolError оборачивается в isError с телом toHttpError", async () => {
+    const wrapped = withToolError(async () => {
+        throw new ProtocolError("peer_not_found", "Чат не найден.");
+    });
+    const result = await wrapped({});
+    assert.equal(result.isError, true);
+    const body = JSON.parse(result.content[0].text);
+    assert.equal(body.error, "peer_not_found");
+    assert.equal(body.message, "Чат не найден.");
 });
 

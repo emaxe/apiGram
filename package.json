@@ -40,11 +40,13 @@
     "start": "node src/index.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "dotenv": "^16.6.1",
     "express": "^4.22.2",
     "multer": "^2.3.0",
     "teleproto": "^1.229.0",
-    "ws": "^8.21.3"
+    "ws": "^8.21.3",
+    "zod": "^3.25.76"
   },
   "engines": {
     "node": ">=18"
