@@ -4,10 +4,11 @@
 [![node](https://img.shields.io/node/v/apigram.svg)](https://nodejs.org)
 [![license](https://img.shields.io/npm/l/apigram.svg)](./LICENSE)
 
-Multi-user Telegram API gateway (MTProto) — REST + WebSocket.
+Multi-user Telegram API gateway (MTProto) — REST, WebSocket и [MCP](#mcp)-сервер для AI-агентов.
 
 Один процесс держит пул `TelegramClient` по одному на аккаунт; любое клиентское приложение
-подключается по HTTP и получает realtime-поток по WebSocket.
+подключается по HTTP и получает realtime-поток по WebSocket — а AI-агент управляет тем же
+аккаунтом через [MCP](#mcp)-инструменты, без отдельного слоя интеграции.
 
 **English version: [README.md](./README.md)**
 
@@ -21,6 +22,7 @@ Multi-user Telegram API gateway (MTProto) — REST + WebSocket.
 - [Быстрый старт](#быстрый-старт)
 - [Эндпоинты](#эндпоинты)
 - [WebSocket](#websocket)
+- [MCP](#mcp) — подключение AI-агентов
 - [Ошибки](#ошибки)
 - [Браузерные клиенты](#браузерные-клиенты)
 - [Прокси](#прокси)
@@ -228,16 +230,76 @@ ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>
 
 ## MCP
 
+apiGram работает и как [MCP](https://modelcontextprotocol.io)-сервер: AI-агент
+(Claude и другие) управляет Telegram-аккаунтом напрямую — читает чаты,
+отправляет сообщения и файлы, ставит реакции, пересылает — без отдельного
+слоя интеграции между агентом и шлюзом.
+
 ```
 POST/GET/DELETE http://127.0.0.1:3111/v1/accounts/<id>/mcp
 Authorization: Bearer <apiToken>
 ```
 
-Streamable HTTP эндпоинт для AI-агентов (MCP). Тот же bearer-токен и та же
-привязка к аккаунту, что и у REST — одна MCP-сессия всегда работает от имени
-одного аккаунта.
+Streamable HTTP-транспорт ([спецификация](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)).
+Тот же bearer-токен и та же привязка к аккаунту, что и у REST — одна
+MCP-сессия всегда работает от имени одного аккаунта, и клиенту нужны ровно
+`accountId` и `apiToken` из [Быстрого старта](#быстрый-старт) выше. Больше
+ничего заводить не нужно: ни отдельных MCP-credentials, ни allow-листа.
 
-Tools:
+### Подключить MCP-клиента
+
+Подойдёт любой клиент, умеющий Streamable HTTP и произвольные заголовки.
+Для Claude Desktop или Claude Code — добавить в конфиг MCP клиента:
+
+```json
+{
+  "mcpServers": {
+    "apigram": {
+      "type": "http",
+      "url": "http://127.0.0.1:3111/v1/accounts/acc_.../mcp",
+      "headers": { "Authorization": "Bearer tok_..." }
+    }
+  }
+}
+```
+
+Если шлюз недоступен агенту локально — укажите в `url` публичный адрес.
+Bearer-токен — единственное, что отделяет агента от этого аккаунта, поэтому
+храните его так же секретно, как любой другой `apiToken`.
+
+### Поговорить руками
+
+Рукопожатие — обычный JSON-RPC 2.0 поверх HTTP, удобно проверить деплой без
+MCP-клиента:
+
+```bash
+MCP=http://127.0.0.1:3111/v1/accounts/$ACC/mcp
+AUTH="Authorization: Bearer $TOKEN"
+ACCEPT='Accept: application/json, text/event-stream'
+JSON='Content-Type: application/json'
+
+# 1. Инициализация — id сессии приходит в заголовке mcp-session-id
+SID=$(curl -sD - -o /dev/null -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}' \
+  | tr -d '\r' | grep -i '^mcp-session-id:' | cut -d' ' -f2)
+
+# 2. Подтверждение рукопожатия — обязательно по протоколу, тела в ответе нет
+curl -s -o /dev/null -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# 3. Список доступных tools
+curl -s -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# 4. Вызов одного из них
+curl -s -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_message","arguments":{"peer":"me","text":"привет из MCP"}}}'
+
+# 5. Закрыть сессию по завершении
+curl -s -X DELETE $MCP -H "$AUTH" -H "mcp-session-id: $SID"
+```
+
+### Tools
 
 | Tool | Описание |
 |---|---|
@@ -253,9 +315,17 @@ Tools:
 | `send_files` | Отправка до 10 файлов как base64: `peer`, `files[]`, `caption` |
 | `download_file` | Метаданные и ссылка на REST-скачивание вложения — не сами байты |
 
+`peer` везде принимает одно и то же: `@username`, юзернейм без собачки,
+числовой ID или `me`.
+
 `download_file` никогда не отдаёт байты внутрь MCP-ответа — только ссылку на
 уже существующий `GET .../chat/:peer/messages/:msgId/file` с тем же
-bearer-токеном: стриминг с поддержкой Range там уже реализован.
+bearer-токеном: стриминг с поддержкой Range там уже реализован, а заворачивать
+байты обратно в результат tool означало бы раздувать контекст агента.
+
+Ошибки инструментов приходят как `isError: true` в результате tool, с тем же
+телом `{ error, message }`, что и у REST ([Ошибки](#ошибки)) — один словарь
+ошибок на оба интерфейса, ничего MCP-специфичного учить не нужно.
 
 ## Ошибки
 

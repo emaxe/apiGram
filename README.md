@@ -4,10 +4,12 @@
 [![node](https://img.shields.io/node/v/apigram.svg)](https://nodejs.org)
 [![license](https://img.shields.io/npm/l/apigram.svg)](./LICENSE)
 
-Multi-user Telegram API gateway (MTProto) — REST + WebSocket.
+Multi-user Telegram API gateway (MTProto) — REST, WebSocket, and an [MCP](#mcp) server for AI agents.
 
 A single process keeps a pool of `TelegramClient` instances, one per account. Any client
-application talks to it over plain HTTP and receives a realtime stream over WebSocket.
+application talks to it over plain HTTP and receives a realtime stream over WebSocket — and
+an AI agent can drive the very same account through [MCP](#mcp) tools, with no custom
+integration layer in between.
 
 **Русская версия: [README.ru.md](./README.ru.md)**
 
@@ -21,6 +23,7 @@ application talks to it over plain HTTP and receives a realtime stream over WebS
 - [Quick start](#quick-start)
 - [Endpoints](#endpoints)
 - [WebSocket](#websocket)
+- [MCP](#mcp) — connect AI agents
 - [Errors](#errors)
 - [Browser clients](#browser-clients)
 - [Proxy](#proxy)
@@ -229,15 +232,76 @@ Close codes: `4001` — bad token or the account is not authorized,
 
 ## MCP
 
+apiGram doubles as an [MCP](https://modelcontextprotocol.io) server, so an AI
+agent (Claude and others) can drive a Telegram account directly — read
+chats, send messages and files, react, forward — without a bespoke
+integration layer between the agent and the gateway.
+
 ```
 POST/GET/DELETE http://127.0.0.1:3111/v1/accounts/<id>/mcp
 Authorization: Bearer <apiToken>
 ```
 
-Streamable HTTP endpoint for AI agents (MCP). Same bearer token and account
-scoping as the REST API — one MCP session always acts as one account.
+Streamable HTTP transport ([spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)).
+Same bearer token and account scoping as the REST API — one MCP session
+always acts as one account, so a client needs exactly the `accountId` and
+`apiToken` from [Quick start](#quick-start) above. Nothing else to
+provision: no separate MCP credentials, no extra allow-list.
 
-Tools:
+### Connect an MCP client
+
+Any client that speaks Streamable HTTP and can send a custom header works.
+For Claude Desktop or Claude Code, add this to the client's MCP config:
+
+```json
+{
+  "mcpServers": {
+    "apigram": {
+      "type": "http",
+      "url": "http://127.0.0.1:3111/v1/accounts/acc_.../mcp",
+      "headers": { "Authorization": "Bearer tok_..." }
+    }
+  }
+}
+```
+
+Point `url` at a public host if the gateway isn't local to the agent — the
+bearer token is the only thing standing between the agent and that one
+account, so keep it as secret as any other `apiToken`.
+
+### Talk to it by hand
+
+The handshake is plain JSON-RPC 2.0 over HTTP — handy for checking a
+deployment without an MCP client:
+
+```bash
+MCP=http://127.0.0.1:3111/v1/accounts/$ACC/mcp
+AUTH="Authorization: Bearer $TOKEN"
+ACCEPT='Accept: application/json, text/event-stream'
+JSON='Content-Type: application/json'
+
+# 1. Initialize — the response carries the session id in `mcp-session-id`
+SID=$(curl -sD - -o /dev/null -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}' \
+  | tr -d '\r' | grep -i '^mcp-session-id:' | cut -d' ' -f2)
+
+# 2. Acknowledge the handshake — required by the protocol, no response body
+curl -s -o /dev/null -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# 3. List the available tools
+curl -s -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# 4. Call one
+curl -s -X POST $MCP -H "$AUTH" -H "$ACCEPT" -H "$JSON" -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_message","arguments":{"peer":"me","text":"hello from MCP"}}}'
+
+# 5. Close the session when done
+curl -s -X DELETE $MCP -H "$AUTH" -H "mcp-session-id: $SID"
+```
+
+### Tools
 
 | Tool | Description |
 |---|---|
@@ -253,9 +317,18 @@ Tools:
 | `send_files` | Send up to 10 files as base64: `peer`, `files[]`, `caption` |
 | `download_file` | Metadata + a REST download link for a message's attachment — not the bytes |
 
+`peer` accepts the same values everywhere: `@username`, a bare username, a
+numeric ID, or `me`.
+
 `download_file` never returns raw bytes inside the MCP response — it points
 back at the existing `GET .../chat/:peer/messages/:msgId/file` endpoint with
-the same bearer token, since Range-based streaming is already implemented there.
+the same bearer token, since Range-based streaming is already implemented
+there and re-inlining bytes into a tool result would just bloat the
+agent's context.
+
+Tool failures come back as `isError: true` in the tool result, with the
+same `{ error, message }` shape the REST API uses (see [Errors](#errors))
+— one error vocabulary for both surfaces, nothing MCP-specific to learn.
 
 ## Errors
 
