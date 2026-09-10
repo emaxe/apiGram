@@ -45,6 +45,7 @@ import { ProtocolError } from "../src/telegram/errors.js";
 import { toHttpError } from "../src/server/httpErrors.js";
 import { withToolError } from "../src/mcp/toolError.js";
 import { registerDialogTools } from "../src/mcp/tools/dialogs.js";
+import { registerMessageTools } from "../src/mcp/tools/messages.js";
 import { parseOrigins, isOriginAllowed, corsMiddleware } from "../src/server/cors.js";
 import { classifyRawUpdate, deletedMessagesEvent } from "../src/telegram/listener.js";
 import { DeletedMessage } from "teleproto/events/index.js";
@@ -2155,6 +2156,145 @@ test("mcp/dialogs: get_history возвращает историю сообще�
         const body = JSON.parse(result.content[0].text);
         assert.equal(body.messages.length, 1);
         assert.equal(body.messages[0].text, "hi");
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+// ── MCP: сообщения ───────────────────────────────────────────────────────────
+
+test("mcp/messages: send_message отправляет текст", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async sendMessage(entity, params) { return { id: 501, message: params.message, date: 1730000000, out: true }; },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMessageTools(server, account);
+        const { cb } = server.tools.get("send_message");
+        const result = await cb({ peer: "ada", text: "привет" });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.text, "привет");
+        assert.equal(body.out, true);
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/messages: edit_message редактирует текст", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async editMessage(entity, params) { return { id: params.message, message: params.text, date: 1730000000, out: true }; },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMessageTools(server, account);
+        const { cb } = server.tools.get("edit_message");
+        const result = await cb({ peer: "ada", messageId: 501, text: "новый текст" });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.id, 501);
+        assert.equal(body.text, "новый текст");
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/messages: delete_messages удаляет сообщения", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async deleteMessages() { return { ptsCount: 1 }; },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMessageTools(server, account);
+        const { cb } = server.tools.get("delete_messages");
+        const result = await cb({ peer: "ada", ids: [1, 2] });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.ok, true);
+        assert.deepEqual(body.deleted, [1, 2]);
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/messages: mark_as_read отмечает чат прочитанным", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    const calls = [];
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async markAsRead(...args) { calls.push(args); },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMessageTools(server, account);
+        const { cb } = server.tools.get("mark_as_read");
+        const result = await cb({ peer: "ada" });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.ok, true);
+        assert.equal(calls.length, 1);
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/messages: react ставит реакцию", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async invoke() { return {}; },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMessageTools(server, account);
+        const { cb } = server.tools.get("react");
+        const result = await cb({ peer: "ada", messageId: 10, emoji: "🔥" });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.ok, true);
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/messages: forward_messages пересылает сообщения", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async forwardMessages() { return [{ id: 900, message: "fwd", date: 1730000000, out: true }]; },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerMessageTools(server, account);
+        const { cb } = server.tools.get("forward_messages");
+        const result = await cb({ toPeer: "ada", ids: [10] });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.sent[0].id, 900);
     } finally {
         sessionManager.clients.delete(account.accountId);
         deleteAccount(account.accountId);
