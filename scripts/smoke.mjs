@@ -19,9 +19,15 @@ import { stdin, stdout } from "node:process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 
 const BASE = process.env.BASE || "http://127.0.0.1:3111/v1";
+// Тот же resolve, что и в src/config.js: от корня пакета и DATA_DIR, а не от
+// cwd процесса — smoke.mjs и сервер должны сойтись на одном каталоге данных
+// независимо от того, откуда запущен сам скрипт.
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "./data");
 const rl = readline.createInterface({ input: stdin, output: stdout });
 
 const ESC = "[";
@@ -258,7 +264,7 @@ async function main() {
         console.log("Теперь, ПОКА не нажали Enter ниже, напишите себе в «Избранное» с телефона.");
         await rl.question("Сообщение отправлено — нажмите Enter, чтобы шлюз переподключился и дозалил его... ");
         await step("докачанный new_message попал в data/updates.jsonl", async () => {
-            const updatesPath = path.join(process.cwd(), "data", "updates.jsonl");
+            const updatesPath = path.join(dataDir, "updates.jsonl");
             if (!fs.existsSync(updatesPath)) {
                 throw new Error(`${updatesPath} не найден — перезапустите сервер с LOG_UPDATES=true`);
             }
