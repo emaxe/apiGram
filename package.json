@@ -1,6 +1,6 @@
 {
   "name": "apigram",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Multi-user Telegram API gateway (MTProto) — REST + WebSocket",
   "keywords": [
     "telegram",
@@ -9,7 +9,11 @@
     "userbot",
     "rest",
     "websocket",
-    "multi-account"
+    "multi-account",
+    "mcp",
+    "model-context-protocol",
+    "ai-agent",
+    "claude"
   ],
   "author": "emaxe",
   "license": "ISC",
@@ -28,6 +32,7 @@
   },
   "files": [
     "src",
+    "skills",
     "run.sh",
     ".env.example",
     "README.md",

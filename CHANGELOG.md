@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-10
+
+### Added
+
+- **`apigram-mcp` agent skill** (`skills/apigram-mcp/SKILL.md`): installable via
+  `npx skills add emaxe/apiGram` ([skills.sh](https://skills.sh/emaxe/apiGram)) into
+  ~20 coding agents at once. Teaches the full MCP tool reference and walks an agent
+  through an interactive setup wizard — locate the apiGram instance, create or
+  reuse an account, run the phone/code/2FA login, and wire up the MCP connection —
+  without ever assuming a fixed host or defaulting to `127.0.0.1`.
+- `mcp`, `model-context-protocol`, `ai-agent`, `claude` added to `package.json`
+  `keywords` so the MCP support surfaces in npm search.
+
+### Changed
+
+- README / README.ru.md: the `## MCP` section now links to the agent skill and
+  documents the `npx skills add` install path.
+- `skills/` added to the npm `files` whitelist so the skill referenced from
+  README ships with the published package, not just the GitHub repo.
+
 ## [1.4.0] - 2026-09-10
 
 ### Added
