@@ -233,7 +233,11 @@ class SessionManager {
         await this.#teardown(accountId, { logOut: true });
         // Сессия отозвана — состояние от неё больше не действительно, и его
         // персистентный снимок (см. #teardown) не должен пережить logout.
-        deleteUpdateState(accountId);
+        try {
+            deleteUpdateState(accountId);
+        } catch (err) {
+            console.error(`apiGram: не удалось удалить update state для ${accountId}: ${err?.message || err}`);
+        }
         this.channel(accountId).emit("account_event", {
             accountEvent: true,
             type: "session_closed",
