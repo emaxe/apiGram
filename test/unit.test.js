@@ -44,6 +44,7 @@ import { toPlain } from "../src/telegram/serialize.js";
 import { ProtocolError } from "../src/telegram/errors.js";
 import { toHttpError } from "../src/server/httpErrors.js";
 import { withToolError } from "../src/mcp/toolError.js";
+import { registerDialogTools } from "../src/mcp/tools/dialogs.js";
 import { parseOrigins, isOriginAllowed, corsMiddleware } from "../src/server/cors.js";
 import { classifyRawUpdate, deletedMessagesEvent } from "../src/telegram/listener.js";
 import { DeletedMessage } from "teleproto/events/index.js";
@@ -2078,5 +2079,85 @@ test("mcp/toolError: ProtocolError оборачивается в isError с те
     const body = JSON.parse(result.content[0].text);
     assert.equal(body.error, "peer_not_found");
     assert.equal(body.message, "Чат не найден.");
+});
+
+// ── MCP: диалоги и история ──────────────────────────────────────────────────
+
+/** Захватывает регистрируемые tools вместо реального McpServer — для юнит-теста хендлера достаточно. */
+function fakeToolServer() {
+    const tools = new Map();
+    return {
+        tools,
+        registerTool(name, config, cb) { tools.set(name, { config, cb }); },
+    };
+}
+
+test("mcp/dialogs: list_dialogs возвращает нормализованные диалоги", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async *iterDialogs() {
+                yield { id: 42, entity: { className: "User", firstName: "Ada", username: "ada" }, message: null, dialog: {} };
+            },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerDialogTools(server, account);
+        const { cb } = server.tools.get("list_dialogs");
+        const result = await cb({});
+        assert.equal(result.isError, undefined);
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.dialogs.length, 1);
+        assert.equal(body.dialogs[0].title, "Ada");
+        assert.equal(body.dialogs[0].username, "ada");
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/dialogs: get_chat возвращает карточку чата", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: { async getEntity() { return { className: "User", id: 777, firstName: "Ada", username: "ada", bot: false }; } },
+    });
+    try {
+        const server = fakeToolServer();
+        registerDialogTools(server, account);
+        const { cb } = server.tools.get("get_chat");
+        const result = await cb({ peer: "ada" });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.type, "user");
+        assert.equal(body.username, "ada");
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
+});
+
+test("mcp/dialogs: get_history возвращает историю сообщений", async () => {
+    const account = createAccount("mcp-test");
+    account.sessionString = "fake";
+    sessionManager.clients.set(account.accountId, {
+        client: {
+            async getEntity() { return { className: "User", id: 777 }; },
+            async *iterMessages() { yield { id: 10, message: "hi", date: 1730000000, out: false }; },
+        },
+    });
+    try {
+        const server = fakeToolServer();
+        registerDialogTools(server, account);
+        const { cb } = server.tools.get("get_history");
+        const result = await cb({ peer: "ada", limit: 10 });
+        const body = JSON.parse(result.content[0].text);
+        assert.equal(body.messages.length, 1);
+        assert.equal(body.messages[0].text, "hi");
+    } finally {
+        sessionManager.clients.delete(account.accountId);
+        deleteAccount(account.accountId);
+    }
 });
 
