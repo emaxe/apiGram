@@ -12,3 +12,4 @@ data/
 *.tgz
 docs/superpowers/
 docs/report/
+.superpowers/
