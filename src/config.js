@@ -26,6 +26,7 @@ if (fs.existsSync(localEnvPath)) {
 const dataDir = path.resolve(rootDir, process.env.DATA_DIR || "./data");
 const accountsFile = path.join(dataDir, "accounts.json");
 const updatesFile = path.join(dataDir, "updates.jsonl");
+const updateStateFile = path.join(dataDir, "updateState.json");
 
 // Версию берём из package.json, а не из строки в коде: её показывает
 // `GET /v1/health`, и клиент по ней сверяет совместимость контракта. Зашитая
@@ -71,6 +72,7 @@ export const config = {
     dataDir,
     accountsFile,
     updatesFile,
+    updateStateFile,
     updatesMaxMb: parseInt(process.env.UPDATES_MAX_MB || "50", 10),
     apiId: parseInt(process.env.TELEGRAM_API_ID || "0", 10),
     apiHash: process.env.TELEGRAM_API_HASH || "",

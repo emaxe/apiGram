@@ -7,6 +7,13 @@ import fs from "node:fs";
 import { readJson, writeJson } from "../src/storage/json.js";
 import { ensureDir } from "../src/storage/json.js";
 import {
+    loadUpdateState,
+    saveUpdateState,
+    deleteUpdateState,
+    shouldFlush,
+    STATE_FLUSH_INTERVAL_MS,
+} from "../src/telegram/updateState.js";
+import {
     createAccount,
     findAccount,
     findAccountByToken,
@@ -2017,5 +2024,39 @@ test("messages: downloadAvatar проверяет photo, etag, 304 и возвр
         () => downloadAvatar(clientNoPhoto, "me"),
         (err) => err instanceof ProtocolError && err.code === "no_avatar"
     );
+});
+
+test("updateState: save/load/delete round-trip на явном файле", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "apigram-"));
+    const file = path.join(dir, "updateState.json");
+
+    assert.equal(loadUpdateState("acc_1", file), null);
+
+    saveUpdateState("acc_1", { pts: 100, qts: 5, date: 1710000000, seq: 42 }, file);
+    const loaded = loadUpdateState("acc_1", file);
+    assert.equal(loaded.pts, 100);
+    assert.equal(loaded.qts, 5);
+    assert.equal(loaded.date, 1710000000);
+    assert.equal(loaded.seq, 42);
+    assert.ok(loaded.savedAt > 0);
+
+    // Второй аккаунт не должен перетереть первый — файл общий на все аккаунты.
+    saveUpdateState("acc_2", { pts: 1, qts: 0, date: 1, seq: 1 }, file);
+    assert.equal(loadUpdateState("acc_1", file).pts, 100);
+    assert.equal(loadUpdateState("acc_2", file).pts, 1);
+
+    deleteUpdateState("acc_1", file);
+    assert.equal(loadUpdateState("acc_1", file), null);
+    assert.equal(loadUpdateState("acc_2", file).pts, 1); // соседа не задели
+
+    // Удаление отсутствующей записи не должно падать.
+    deleteUpdateState("acc_1", file);
+    deleteUpdateState("acc_nope", file);
+});
+
+test("updateState: shouldFlush — не чаще одного раза за окно", () => {
+    assert.equal(shouldFlush(0, 1000, STATE_FLUSH_INTERVAL_MS), true); // никогда не сохраняли
+    assert.equal(shouldFlush(1000, 1000 + STATE_FLUSH_INTERVAL_MS - 1, STATE_FLUSH_INTERVAL_MS), false);
+    assert.equal(shouldFlush(1000, 1000 + STATE_FLUSH_INTERVAL_MS, STATE_FLUSH_INTERVAL_MS), true);
 });
 
