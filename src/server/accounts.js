@@ -5,6 +5,7 @@ import {
     updateAccount,
     deleteAccount as delAccount,
 } from "../registry/accountsFile.js";
+import { deleteUpdateState } from "../telegram/updateState.js";
 
 /** Функции сохранения, которые протокол auth вызывает после логина. */
 export const accountStore = {
@@ -61,7 +62,9 @@ export function makeAccount(name) {
  */
 export function removeAccount(accountId, token) {
     if (!getAccount(accountId, token)) return false;
-    return delAccount(accountId);
+    const removed = delAccount(accountId);
+    if (removed) deleteUpdateState(accountId);
+    return removed;
 }
 
 /**
