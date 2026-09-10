@@ -248,6 +248,22 @@ always acts as one account, so a client needs exactly the `accountId` and
 `apiToken` from [Quick start](#quick-start) above. Nothing else to
 provision: no separate MCP credentials, no extra allow-list.
 
+### Agent skill
+
+Want an AI coding agent to already know all of the above — including an
+interactive setup wizard that locates the instance, creates/authorizes an
+account, and wires up the connection for you? Install the
+[`apigram-mcp`](skills/apigram-mcp/SKILL.md) skill via
+[skills.sh](https://skills.sh/emaxe/apiGram):
+
+```bash
+npx skills add emaxe/apiGram
+```
+
+This installs it for ~20 agents at once (Claude Code, Cursor, Codex,
+Cline, Goose, and more) into `.agents/skills/apigram-mcp` in the current
+project — add `-g` to install it globally instead.
+
 ### Connect an MCP client
 
 Any client that speaks Streamable HTTP and can send a custom header works.
