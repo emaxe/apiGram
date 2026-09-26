@@ -100,6 +100,7 @@ The address used by `start` / `health` / `smoke` is read from `.env` rather than
 | `PROXY_URL` | empty | proxy for the MTProto connection: `socks5://`, `socks4://`, `http://`, `https://`, `mtproxy://`; empty = direct connection |
 | `PROXY_TIMEOUT` | `5` | proxy connection timeout, seconds |
 | `PROXY_FROM_ENV` | `false` | when `PROXY_URL` is empty, take the proxy from `https_proxy` → `all_proxy` → `http_proxy` (either case) |
+| `AUTOCONNECT_ACCOUNTS` | `false` | connect all accounts with a saved session at process startup |
 
 ## Quick start
 
@@ -203,17 +204,23 @@ came `chatId` (always marked), `groupedId` (albums), `fwdFrom`, `viaBotId` and
 ## WebSocket
 
 ```
-ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>
+ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>&since=<seq>
 ```
 
 Connecting spins up the Telegram client for the account if it is not running yet.
 One account may hold several sockets — all of them receive the stream.
 
+`since=<seq>` (optional): reconnect — replays buffered events with `seq > since`
+before the live stream. The buffer holds the last 500 events per account; if it
+no longer covers the gap, the client gets `since_gap` (`latestSeq`) instead of a
+silent hole and must backfill via REST.
+
 Events (`JSON`, every one carries `accountEvent: true`):
 
 | `type` | Payload |
 |---|---|
-| `connected` | `accountId` — subscription confirmed |
+| `connected` | `accountId`, `seq` — subscription confirmed, latest buffered seq |
+| `since_gap` | `accountId`, `latestSeq` — buffer no longer covers the requested `since` range |
 | `new_message` / `edited_message` | `message` — normalized message |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |

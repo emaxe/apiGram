@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ответ теперь `{ messages, nextOffsetId }`.
 - Постраничная загрузка диалогов (`offsetDate`/`offsetId`/`offsetPeer`, ответ `{ dialogs, next }`),
   поля `canPost`, `participantsCount`, `forum`, `noforwards`.
+- `AUTOCONNECT_ACCOUNTS=true` подключает аккаунты с сохранённой сессией при старте.
+- WebSocket принимает `?since=<seq>`: кольцевой буфер (500 событий на аккаунт) отдаёт
+  хвост при переподключении; `since_gap`, если хвост уже вытеснен.
 
 ## [1.4.1] - 2026-09-10
 

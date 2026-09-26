@@ -3,6 +3,7 @@ import { test } from "node:test";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { EventEmitter } from "node:events";
 
 import { readJson, writeJson } from "../src/storage/json.js";
 import { ensureDir } from "../src/storage/json.js";
@@ -21,6 +22,7 @@ import {
     deleteAccount,
 } from "../src/registry/accountsFile.js";
 import { sessionManager } from "../src/telegram/sessionManager.js";
+import { AccountEventBuffer } from "../src/telegram/eventBuffer.js";
 import { authStatus } from "../src/telegram/auth.js";
 import { Api } from "teleproto";
 import { _downloadPhoto } from "teleproto/client/downloads.js";
@@ -96,6 +98,53 @@ test("registry: create/find/update/delete", () => {
     assert.equal(deleteAccount(account.accountId), false);
 });
 
+test("eventBuffer: push присваивает монотонный seq и режет по размеру", () => {
+    const buffer = new AccountEventBuffer(3);
+    const a = buffer.push({ type: "a" });
+    const b = buffer.push({ type: "b" });
+    assert.equal(a.seq, 1);
+    assert.equal(b.seq, 2);
+    buffer.push({ type: "c" });
+    buffer.push({ type: "d" }); // выталкивает "a" (seq=1) — размер буфера 3
+    assert.equal(buffer.latestSeq(), 4);
+    assert.deepEqual(buffer.tail(0).events.map((e) => e.type), ["b", "c", "d"]);
+});
+
+test("eventBuffer: tail отдаёт только события после sinceSeq", () => {
+    const buffer = new AccountEventBuffer(10);
+    for (const type of ["a", "b", "c"]) buffer.push({ type });
+    const { events, gap } = buffer.tail(1);
+    assert.deepEqual(events.map((e) => e.type), ["b", "c"]);
+    assert.equal(gap, false);
+});
+
+test("eventBuffer: tail сигналит gap, если since старше вытесненного диапазона", () => {
+    const buffer = new AccountEventBuffer(2);
+    for (const type of ["a", "b", "c", "d"]) buffer.push({ type }); // "a"(1),"b"(2) вытеснены
+    const { events, gap } = buffer.tail(1); // seq=1 уже не в буфере (earliest seq=3)
+    assert.equal(gap, true);
+    assert.deepEqual(events.map((e) => e.type), ["c", "d"]);
+});
+
+test("eventBuffer: пустой буфер и since равный latestSeq — без gap и без событий", () => {
+    const buffer = new AccountEventBuffer(2);
+    buffer.push({ type: "a" });
+    const { events, gap } = buffer.tail(1);
+    assert.deepEqual(events, []);
+    assert.equal(gap, false);
+});
+
+test("eventBuffer: attach проставляет seq раньше остальных слушателей канала", () => {
+    const channel = new EventEmitter();
+    const buffer = new AccountEventBuffer(10);
+    buffer.attach(channel);
+    const seenSeq = [];
+    channel.on("account_event", (e) => seenSeq.push(e.seq));
+    channel.emit("account_event", { type: "x" });
+    assert.equal(seenSeq[0], 1);
+    assert.equal(buffer.latestSeq(), 1);
+});
+
 test("sessionManager: channel переиспользуется и переживает release", async () => {
     const c1 = sessionManager.channel("acc_x");
     const c2 = sessionManager.channel("acc_x");
@@ -125,6 +174,41 @@ test("sessionManager: onChannelCreated срабатывает только на 
     assert.deepEqual(seen, ["acc_obs"]);
     sessionManager.channelObservers.length = 0;
     sessionManager.channels.delete("acc_obs");
+});
+
+test("sessionManager: eventBuffer создаётся вместе с channel и переживает повторные обращения", () => {
+    const buf1 = sessionManager.eventBuffer("acc_evt");
+    const buf2 = sessionManager.eventBuffer("acc_evt");
+    assert.equal(buf1, buf2);
+    const bus = sessionManager.channel("acc_evt");
+    bus.emit("account_event", { type: "x" });
+    assert.equal(buf1.latestSeq(), 1);
+    sessionManager.channels.delete("acc_evt");
+    sessionManager.eventBuffers.delete("acc_evt");
+});
+
+test("sessionManager: autoconnectAll подключает все аккаунты с сессией, ошибка одного не валит остальные", async () => {
+    const accounts = [
+        { accountId: "acc_ok", sessionString: "s1" },
+        { accountId: "acc_bad", sessionString: "s2" },
+        { accountId: "acc_no_session", sessionString: "" },
+    ];
+    const attempted = [];
+    const getClient = async (account) => {
+        attempted.push(account.accountId);
+        if (account.accountId === "acc_bad") throw new Error("session_invalid");
+        return { accountId: account.accountId };
+    };
+    const summary = await sessionManager.autoconnectAll({
+        readRegistry: () => ({ accounts }),
+        getClient,
+    });
+    assert.deepEqual(attempted, ["acc_ok", "acc_bad"]); // без sessionString не пытаемся вовсе
+    assert.equal(summary.attempted, 2);
+    assert.equal(summary.connected, 1);
+    assert.equal(summary.failed.length, 1);
+    assert.equal(summary.failed[0].accountId, "acc_bad");
+    assert.match(summary.failed[0].error, /session_invalid/);
 });
 
 test("auth: authStatus по состояниям", () => {
@@ -2617,6 +2701,110 @@ test("mcp: initialize → tools/list → tools/call проходят через 
         if (sessionId) {
             await fetch(mcpUrl, { method: "DELETE", headers: { ...headers, "mcp-session-id": sessionId } }).catch(() => {});
         }
+        deleteAccount(account.accountId);
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
+// ── WebSocket: буфер событий, ?since=, since_gap ────────────────────────────
+
+test("ws: переподключение с ?since= отдаёт хвост буфера, затем живые события", async () => {
+    const { attachWs } = await import("../src/server/ws.js");
+    const http = await import("node:http");
+    const WebSocket = (await import("ws")).default;
+
+    const account = createAccount("ws-test");
+    updateAccount(account.accountId, { status: "authorized" });
+    // getClient упал бы без реальной сессии Telegram — тест проверяет доставку
+    // буфера, а не поднятие клиента, поэтому подменяем метод на время теста.
+    const originalGetClient = sessionManager.getClient;
+    sessionManager.getClient = async () => ({});
+
+    const server = http.createServer();
+    attachWs(server);
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address();
+
+    let ws;
+    try {
+        const bus = sessionManager.channel(account.accountId);
+        bus.emit("account_event", { accountEvent: true, type: "new_message", text: "1" });
+        bus.emit("account_event", { accountEvent: true, type: "new_message", text: "2" });
+        // seq теперь 1 и 2 — клиент переподключается как будто видел только seq=1.
+
+        const url = `ws://127.0.0.1:${port}/v1/ws?accountId=${account.accountId}&token=${account.apiToken}&since=1`;
+        ws = new WebSocket(url);
+        const received = [];
+        await new Promise((resolve, reject) => {
+            ws.on("message", (data) => {
+                received.push(JSON.parse(data.toString()));
+                if (received.length >= 2) resolve();
+            });
+            ws.on("error", reject);
+            setTimeout(() => reject(new Error("timeout waiting for buffered tail")), 2000);
+        });
+
+        // Первым уходит хвост буфера (seq=2, «1» уже видели), потом — connected.
+        assert.equal(received[0].text, "2");
+        assert.equal(received[0].seq, 2);
+    } finally {
+        // Незакрытый клиентский сокет держит HTTP-сервер живым: server.close()
+        // ждёт разрыва всех соединений и не вызовет колбэк, пока WS открыт —
+        // особенно важно на RED-прогоне, где ожидание выше падает по таймауту
+        // и успевает пропустить обычный `ws.close()` после await.
+        ws?.close();
+        sessionManager.getClient = originalGetClient;
+        sessionManager.channels.delete(account.accountId);
+        sessionManager.eventBuffers.delete(account.accountId);
+        deleteAccount(account.accountId);
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
+test("ws: since старше вытесненного диапазона буфера — приходит since_gap", async () => {
+    const { attachWs } = await import("../src/server/ws.js");
+    const http = await import("node:http");
+    const WebSocket = (await import("ws")).default;
+
+    const account = createAccount("ws-gap-test");
+    updateAccount(account.accountId, { status: "authorized" });
+    const originalGetClient = sessionManager.getClient;
+    sessionManager.getClient = async () => ({});
+
+    const server = http.createServer();
+    attachWs(server);
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address();
+
+    let ws;
+    try {
+        const buffer = sessionManager.eventBuffer(account.accountId);
+        // Буфер по умолчанию держит 500 событий. since=earliest-1 — это стык
+        // без потерь (не gap), поэтому нужно вытеснить ДВА первых события:
+        // 502 пуша оставляют earliest=3, и since=1 однозначно попадает в уже
+        // вытесненный диапазон.
+        for (let i = 0; i < 502; i++) buffer.push({ accountEvent: true, type: "new_message", i });
+
+        const url = `ws://127.0.0.1:${port}/v1/ws?accountId=${account.accountId}&token=${account.apiToken}&since=1`;
+        ws = new WebSocket(url);
+        const received = [];
+        await new Promise((resolve, reject) => {
+            ws.on("message", (data) => {
+                received.push(JSON.parse(data.toString()));
+                if (received.some((e) => e.type === "since_gap")) resolve();
+            });
+            ws.on("error", reject);
+            setTimeout(() => reject(new Error("timeout waiting for since_gap")), 2000);
+        });
+
+        assert.ok(received.some((e) => e.type === "since_gap"));
+    } finally {
+        // См. комментарий в предыдущем тесте: закрыть сокет ДО server.close(),
+        // иначе висящее соединение не даёт колбэку close сработать на RED.
+        ws?.close();
+        sessionManager.getClient = originalGetClient;
+        sessionManager.channels.delete(account.accountId);
+        sessionManager.eventBuffers.delete(account.accountId);
         deleteAccount(account.accountId);
         await new Promise((resolve) => server.close(resolve));
     }

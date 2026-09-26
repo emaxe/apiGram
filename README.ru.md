@@ -99,6 +99,7 @@ npx apigram
 | `PROXY_URL` | пусто | прокси для MTProto: `socks5://`, `socks4://`, `http://`, `https://`, `mtproxy://`; пусто = прямое подключение |
 | `PROXY_TIMEOUT` | `5` | таймаут подключения к прокси, секунды |
 | `PROXY_FROM_ENV` | `false` | при пустом `PROXY_URL` брать прокси из `https_proxy` → `all_proxy` → `http_proxy` (регистр любой) |
+| `AUTOCONNECT_ACCOUNTS` | `false` | подключать все аккаунты с сохранённой сессией при старте процесса |
 
 ## Быстрый старт
 
@@ -201,17 +202,23 @@ downloadable}`. Размеры известны до загрузки — заг
 ## WebSocket
 
 ```
-ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>
+ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>&since=<seq>
 ```
 
 Подключение поднимает клиента Telegram для аккаунта, если он ещё не поднят.
 Один аккаунт может держать несколько сокетов — поток получают все.
 
+`since=<seq>` (опционально): переподключение — отдаёт буферизованные события с
+`seq > since` перед живым потоком. Буфер держит последние 500 событий на
+аккаунт; если хвост уже вытеснен, вместо тихого пропуска клиент получает
+`since_gap` (`latestSeq`) и должен долить историю через REST.
+
 События (`JSON`, все с `accountEvent: true`):
 
 | `type` | Полезная нагрузка |
 |---|---|
-| `connected` | `accountId` — подтверждение подписки |
+| `connected` | `accountId`, `seq` — подтверждение подписки, последний seq в буфере |
+| `since_gap` | `accountId`, `latestSeq` — буфер уже не покрывает запрошенный диапазон `since` |
 | `new_message` / `edited_message` | `message` — нормализованное сообщение |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |

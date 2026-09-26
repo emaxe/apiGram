@@ -57,6 +57,7 @@ export function attachWs(httpServer) {
         if (socket.readyState !== socket.OPEN) return;
 
         const bus = sessionManager.channel(accountId);
+        const buffer = sessionManager.eventBuffer(accountId);
         const listener = (event) => {
             if (socket.readyState === socket.OPEN) {
                 socket.send(stringify(event));
@@ -65,9 +66,26 @@ export function attachWs(httpServer) {
                 socket.close(4003, "session_closed");
             }
         };
+        // Слушатель регистрируется до чтения буфера и без await между ними:
+        // JS однопоточный, поэтому ни одно событие не может проскочить мимо
+        // обоих — либо оно уже в буфере, либо его поймает listener.
         bus.on("account_event", listener);
         socket.on("close", () => bus.off("account_event", listener));
-        socket.send(stringify({ accountEvent: true, type: "connected", accountId }));
+
+        const sinceParam = url.searchParams.get("since");
+        if (sinceParam !== null) {
+            const sinceSeq = parseInt(sinceParam, 10);
+            if (!Number.isNaN(sinceSeq)) {
+                const { events, gap } = buffer.tail(sinceSeq);
+                if (gap && socket.readyState === socket.OPEN) {
+                    socket.send(stringify({ accountEvent: true, type: "since_gap", accountId, latestSeq: buffer.latestSeq() }));
+                }
+                for (const event of events) {
+                    if (socket.readyState === socket.OPEN) socket.send(stringify(event));
+                }
+            }
+        }
+        socket.send(stringify({ accountEvent: true, type: "connected", accountId, seq: buffer.latestSeq() }));
     });
 
     // Отстрел мёртвых соединений: без этого повисшие сокеты копятся до перезапуска.

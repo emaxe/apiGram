@@ -25,6 +25,14 @@ const server = app.listen(config.port, config.host, () => {
     if (startUpdatesLog()) {
         console.log(`apiGram updates log: ${config.updatesFile} (ротация ${config.updatesMaxMb} MB)`);
     }
+    if (config.autoconnectAccounts) {
+        sessionManager.autoconnectAll()
+            .then(({ attempted, connected, failed }) => {
+                console.log(`apiGram: автоподключение — ${connected}/${attempted} аккаунтов`);
+                for (const f of failed) console.error(`apiGram: автоподключение ${f.accountId} не удалось: ${f.error}`);
+            })
+            .catch((err) => console.error(`apiGram: автоподключение аккаунтов упало: ${err?.message || err}`));
+    }
     // Пустой ADMIN_TOKEN оставляет POST /v1/accounts открытым. На localhost это
     // осознанное удобство, на любом другом адресе — дыра, о которой нужно сказать вслух.
     if (!config.adminToken && config.host !== "127.0.0.1" && config.host !== "localhost") {

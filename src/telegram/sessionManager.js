@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events";
 import { buildClient, apiCredentials } from "./client.js";
 import { ProtocolError } from "./errors.js";
 import { loadUpdateState, saveUpdateState, deleteUpdateState, shouldFlush } from "./updateState.js";
+import { AccountEventBuffer } from "./eventBuffer.js";
+import { readRegistry } from "../registry/accountsFile.js";
 
 /**
  * Пул TelegramClient по аккаунтам. Авторизованные клиенты живут в `clients`
@@ -16,6 +18,8 @@ class SessionManager {
         this.pendingAuth = new Map();
         /** @type {Map<string, EventEmitter>} канал событий на аккаунт */
         this.channels = new Map();
+        /** @type {Map<string, import("./eventBuffer.js").AccountEventBuffer>} буфер событий на аккаунт */
+        this.eventBuffers = new Map();
         /** @type {Map<string, Promise<import("teleproto").TelegramClient>>} влетающие подключения */
         this.connecting = new Map();
         /** @type {Array<(accountId: string, bus: EventEmitter) => void>} наблюдатели за созданием каналов */
@@ -42,11 +46,45 @@ class SessionManager {
             const bus = new EventEmitter();
             bus.setMaxListeners(0);
             this.channels.set(accountId, bus);
+            const buffer = new AccountEventBuffer();
+            buffer.attach(bus);
+            this.eventBuffers.set(accountId, buffer);
             for (const observer of this.channelObservers) {
                 try { observer(accountId, bus); } catch { /* наблюдатель не должен ломать канал */ }
             }
         }
         return this.channels.get(accountId);
+    }
+
+    /**
+     * Буфер событий аккаунта. Создаётся вместе с каналом — то есть до первого
+     * события, а не по первому WS-подключению: иначе автоподключенный при
+     * старте аккаунт терял бы события до первого клиента.
+     * @param {string} accountId
+     * @returns {import("./eventBuffer.js").AccountEventBuffer}
+     */
+    eventBuffer(accountId) {
+        this.channel(accountId);
+        return this.eventBuffers.get(accountId);
+    }
+
+    /**
+     * Подключает при старте процесса все аккаунты с сохранённой сессией.
+     * Ошибка одного аккаунта (просроченная/отозванная сессия) не должна
+     * остановить остальные — это старт сервиса, а не запрос одного клиента.
+     * @param {{ readRegistry?: () => { accounts: Array<object> }, getClient?: (account: object) => Promise<unknown> }} [deps]
+     * @returns {Promise<{ attempted: number, connected: number, failed: Array<{ accountId: string, error: string }> }>}
+     */
+    async autoconnectAll({ readRegistry: readRegistryDep = readRegistry, getClient = (a) => this.getClient(a) } = {}) {
+        const authorized = readRegistryDep().accounts.filter((a) => a.sessionString);
+        const results = await Promise.allSettled(authorized.map((a) => getClient(a)));
+        const failed = [];
+        let connected = 0;
+        results.forEach((r, i) => {
+            if (r.status === "fulfilled") connected += 1;
+            else failed.push({ accountId: authorized[i].accountId, error: String(r.reason?.message || r.reason) });
+        });
+        return { attempted: authorized.length, connected, failed };
     }
 
     /**
