@@ -49,6 +49,9 @@ const RAW_PATTERNS = [
     { pattern: /MESSAGE_ID_INVALID|MESSAGE_DELETE_FORBIDDEN|PIN_RESTRICTED/i, status: 400, code: "message_invalid" },
     { pattern: /MESSAGE_NOT_MODIFIED|MESSAGE_EMPTY|MESSAGE_TOO_LONG/i, status: 400, code: "message_invalid" },
     { pattern: /REACTION_INVALID|REACTIONS_TOO_MANY/i, status: 400, code: "reaction_invalid" },
+    // Сервер сам отклоняет пересылку/копирование защищённого контента — тем же
+    // кодом, что и наша собственная проверка entity.noforwards в copy.js.
+    { pattern: /CHAT_FORWARDS_RESTRICTED/i, status: 409, code: "protected_content" },
     { pattern: /Could not find the input entity|Cannot find any entity/i, status: 404, code: "peer_not_found" },
     // Последним: у ошибок пакета socks своего кода нет, а паттерн широкий —
     // выше него стоят все проверки, где сообщение опознаётся точнее.

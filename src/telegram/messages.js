@@ -156,8 +156,11 @@ export async function fetchHistory(client, rawPeer, {
 } = {}) {
     const entity = await resolveEntity(client, rawPeer);
     const raw = [];
+    // TL ждёт секунды, клиенту наружу отдаём миллисекунды — как и все
+    // остальные даты в API (см. fetchDialogs).
+    const offsetDateSec = offsetDate ? Math.floor(offsetDate / 1000) : 0;
     const load = async () => {
-        for await (const msg of client.iterMessages(entity, { limit, offsetId, offsetDate, minId, maxId, reverse })) {
+        for await (const msg of client.iterMessages(entity, { limit, offsetId, offsetDate: offsetDateSec, minId, maxId, reverse })) {
             if (msg && msg.className !== "MessageEmpty") raw.push(msg);
         }
     };

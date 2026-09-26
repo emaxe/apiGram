@@ -159,6 +159,7 @@ GET    /v1/accounts/:id/dialogs?limit&archived&query&offsetDate&offsetId&offsetP
 GET    /v1/accounts/:id/chat/:peer                    chat info
 GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&offsetDate&minId&maxId&reverse
                                                       -> { messages[], nextOffsetId }
+                                                      (offsetDate in milliseconds, like every other date in this API)
 
 # Messages
 POST   /v1/accounts/:id/chat/:peer/messages           { text, replyTo?, topMsgId?, quoteText?, quoteOffset?, parseMode?, silent?, linkPreview?, schedule? }

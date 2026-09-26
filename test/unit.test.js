@@ -134,6 +134,19 @@ test("eventBuffer: пустой буфер и since равный latestSeq — �
     assert.equal(gap, false);
 });
 
+test("eventBuffer: since больше latestSeq — gap (например, процесс перезапустился и seq обнулился)", () => {
+    const freshAfterRestart = new AccountEventBuffer(500);
+    // Клиент помнит since=5000 из прошлого запуска процесса; после рестарта
+    // буфер пуст, а seq снова считает с нуля — продолжать молча нельзя.
+    const empty = freshAfterRestart.tail(5000);
+    assert.deepEqual(empty.events, []);
+    assert.equal(empty.gap, true);
+
+    for (let i = 0; i < 3; i++) freshAfterRestart.push({ type: "post-restart" });
+    const withSomeEvents = freshAfterRestart.tail(5000);
+    assert.equal(withSomeEvents.gap, true);
+});
+
 test("eventBuffer: attach проставляет seq раньше остальных слушателей канала", () => {
     const channel = new EventEmitter();
     const buffer = new AccountEventBuffer(10);
@@ -280,12 +293,14 @@ test("messages: fetchHistory принимает offsetDate/minId/maxId и отд
     const page = await fetchHistory(client, "me", {
         limit: 2,
         offsetId: 500,
-        offsetDate: 1_700_000_000,
+        offsetDate: 1_700_000_000_000,
         minId: 10,
         maxId: 490,
         reverse: false,
     });
     assert.equal(calls[0].offsetId, 500);
+    // offsetDate уходит в teleproto в секундах TL, а клиенту показываем мс —
+    // как и все остальные даты в API (см. fetchDialogs).
     assert.equal(calls[0].offsetDate, 1_700_000_000);
     assert.equal(calls[0].minId, 10);
     assert.equal(calls[0].maxId, 490);
@@ -455,6 +470,47 @@ test("dialogs: fetchDialogs при FloodWait короче лимита ждёт 
     assert.equal(page.dialogs.length, 1);
 });
 
+test("dialogs: fetchDialogs при долгом FloodWait не отсиживает — пробрасывает наружу как 429", async () => {
+    const { FloodWaitError } = (await import("teleproto")).errors;
+    const client = {
+        async *iterDialogs() {
+            const err = new FloodWaitError({ seconds: 0 });
+            err.seconds = 60;
+            throw err;
+        },
+    };
+    const { fetchDialogs } = await import("../src/telegram/dialogs.js");
+    try {
+        await fetchDialogs(client, { limit: 40 });
+        assert.fail("должно было упасть");
+    } catch (err) {
+        const httpErr = toHttpError(err);
+        assert.equal(httpErr.status, 429);
+        assert.equal(httpErr.body.seconds, 60);
+    }
+});
+
+test("messages: fetchHistory при долгом FloodWait не отсиживает — пробрасывает наружу как 429", async () => {
+    const { FloodWaitError } = (await import("teleproto")).errors;
+    const client = {
+        async getEntity() { return { className: "User", id: 1 }; },
+        async *iterMessages() {
+            const err = new FloodWaitError({ seconds: 0 });
+            err.seconds = 60;
+            throw err;
+        },
+    };
+    const { fetchHistory } = await import("../src/telegram/messages.js");
+    try {
+        await fetchHistory(client, "me", { limit: 40 });
+        assert.fail("должно было упасть");
+    } catch (err) {
+        const httpErr = toHttpError(err);
+        assert.equal(httpErr.status, 429);
+        assert.equal(httpErr.body.seconds, 60);
+    }
+});
+
 test("httpErrors: коды ProtocolError → HTTP-статусы, а не тотальный 500", () => {
     const notFound = toHttpError(new ProtocolError("peer_not_found", "Чат не найден."));
     assert.equal(notFound.status, 404);
@@ -484,6 +540,15 @@ test("httpErrors: коды ProtocolError → HTTP-статусы, а не тот
 
 test("httpErrors: protected_content -> 409", () => {
     const err = toHttpError(new ProtocolError("protected_content", "Источник запрещает пересылку."));
+    assert.equal(err.status, 409);
+    assert.equal(err.body.error, "protected_content");
+});
+
+test("httpErrors: сырой CHAT_FORWARDS_RESTRICTED от Telegram — тоже 409 protected_content, а не 500", () => {
+    // Наша собственная проверка entity.noforwards ловит не все случаи защиты
+    // контента (например, per-message noforwards) — сервер в таких случаях
+    // отвечает этим кодом напрямую при forward/copy.
+    const err = toHttpError(Object.assign(new Error("boom"), { errorMessage: "CHAT_FORWARDS_RESTRICTED" }));
     assert.equal(err.status, 409);
     assert.equal(err.body.error, "protected_content");
 });
@@ -527,6 +592,64 @@ test("copy: с подписью использует media исходных со
     const sent = await copyMessages(client, "target", [1], { fromPeer: "source", caption: "подпись" });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].text, "подпись");
+});
+
+test("copy: подпись на текстовое сообщение без вложения — обычный текст, а не sendFile", async () => {
+    const client = {
+        async getEntity(peer) { return { className: "Channel", id: 1, noforwards: false }; },
+        async getMessages(entity, { ids }) {
+            return ids.map((id) => ({ id, media: null }));
+        },
+        async forwardMessages() { throw new Error("не должен вызываться при наличии caption"); },
+        async sendFile() { throw new Error("sendFile требует file — текст без вложения так не отправить"); },
+        async sendMessage(entity, params) {
+            assert.equal(params.message, "новая подпись");
+            return { id: 42, message: "новая подпись" };
+        },
+    };
+    const { copyMessages } = await import("../src/telegram/copy.js");
+    const sent = await copyMessages(client, "target", [1], { fromPeer: "source", caption: "новая подпись" });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].text, "новая подпись");
+});
+
+test("copy: подпись на альбом — один sendFile с массивом media, а не N постов", async () => {
+    const mediaA = { className: "MessageMediaPhoto", photo: { className: "Photo", id: 1 } };
+    const mediaB = { className: "MessageMediaPhoto", photo: { className: "Photo", id: 2 } };
+    const sendFileCalls = [];
+    const client = {
+        async getEntity(peer) { return { className: "Channel", id: 1, noforwards: false }; },
+        async getMessages(entity, { ids }) {
+            return [{ id: ids[0], media: mediaA }, { id: ids[1], media: mediaB }];
+        },
+        async forwardMessages() { throw new Error("не должен вызываться при наличии caption"); },
+        async sendFile(entity, params) {
+            sendFileCalls.push(params);
+            return [{ id: 100, message: "альбом" }, { id: 101, message: "" }];
+        },
+    };
+    const { copyMessages } = await import("../src/telegram/copy.js");
+    const sent = await copyMessages(client, "target", [1, 2], { fromPeer: "source", caption: "альбом" });
+    assert.equal(sendFileCalls.length, 1, "альбом должен уйти одним sendFile, а не по одному на сообщение");
+    assert.deepEqual(sendFileCalls[0].file, [mediaA, mediaB]);
+    assert.equal(sendFileCalls[0].caption, "альбом");
+    assert.equal(sent.length, 2);
+});
+
+test("copy: неподдерживаемый тип вложения (webpage) — понятная ошибка, а не падение teleproto", async () => {
+    const client = {
+        async getEntity(peer) { return { className: "Channel", id: 1, noforwards: false }; },
+        async getMessages(entity, { ids }) {
+            return ids.map((id) => ({ id, media: { className: "MessageMediaWebPage" } }));
+        },
+        async forwardMessages() { throw new Error("не должен вызываться при наличии caption"); },
+        async sendFile() { throw new Error("не должен вызываться — вложение уже отклонено проверкой"); },
+    };
+    const { copyMessages } = await import("../src/telegram/copy.js");
+    await assert.rejects(
+        () => copyMessages(client, "target", [1], { fromPeer: "source", caption: "подпись" }),
+        (err) => err instanceof ProtocolError && err.code === "unsupported_media"
+    );
 });
 
 test("copy: noforwards у источника — protected_content, sendFile/forward не вызываются", async () => {
