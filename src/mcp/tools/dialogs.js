@@ -23,8 +23,8 @@ export function registerDialogTools(server, account) {
         },
         withToolError(async ({ limit, archived, query }) => {
             const client = await sessionManager.getClient(account);
-            const dialogs = await dlg.fetchDialogs(client, { limit, archived, query });
-            return { content: [{ type: "text", text: JSON.stringify({ dialogs }, null, 2) }] };
+            const page = await dlg.fetchDialogs(client, { limit, archived, query });
+            return { content: [{ type: "text", text: JSON.stringify({ dialogs: page.dialogs, next: page.next }, null, 2) }] };
         })
     );
 

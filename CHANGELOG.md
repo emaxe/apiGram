@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Постраничная история чата: `offsetDate`, `minId`, `maxId` у `GET .../chat/:peer/history`,
   ответ теперь `{ messages, nextOffsetId }`.
+- Постраничная загрузка диалогов (`offsetDate`/`offsetId`/`offsetPeer`, ответ `{ dialogs, next }`),
+  поля `canPost`, `participantsCount`, `forum`, `noforwards`.
 
 ## [1.4.1] - 2026-09-10
 

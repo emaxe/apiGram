@@ -146,14 +146,17 @@ export function buildRouter() {
     r.get("/accounts/:accountId/dialogs", async (req, res, next) => {
         try {
             const client = await getClient(req);
-            const { limit, archived, query } = req.query;
-            const dialogs = await dlg.fetchDialogs(client, {
+            const { limit, archived, query, offsetDate, offsetId, offsetPeer } = req.query;
+            const page = await dlg.fetchDialogs(client, {
                 limit: parseInt(limit || "100", 10),
                 // undefined — «без фильтра», в отличие от явного false.
                 archived: archived === undefined ? undefined : archived === "true",
                 query,
+                offsetDate: parseInt(offsetDate || "0", 10),
+                offsetId: parseInt(offsetId || "0", 10),
+                offsetPeer,
             });
-            res.json({ dialogs });
+            res.json({ dialogs: page.dialogs, next: page.next });
         } catch (err) { next(err); }
     });
 

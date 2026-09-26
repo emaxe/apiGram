@@ -40,6 +40,10 @@ export function normalizeDialog(dialog) {
             out: Boolean(message.out),
             mediaType: message.media?.className || null,
         } : null,
+        canPost: canPost(entity),
+        participantsCount: entity.participantsCount ?? null,
+        forum: Boolean(entity.forum),
+        noforwards: Boolean(entity.noforwards),
     };
 }
 
@@ -69,6 +73,22 @@ export async function fetchChat(client, rawPeer) {
     };
 }
 
+/**
+ * Может ли аккаунт писать в этот чат. Упрощение: учитывает только права
+ * администратора/создателя и дефолтные ограничения чата, но не персональный
+ * `bannedRights` конкретного участника — тот в ответе `getDialogs` не приходит.
+ * @param {object} entity
+ * @returns {boolean}
+ */
+function canPost(entity) {
+    if (!entity) return false;
+    if (entity.className === "Channel" && entity.broadcast) {
+        return Boolean(entity.creator) || Boolean(entity.adminRights?.postMessages);
+    }
+    if (entity.className === "User") return true;
+    return Boolean(entity.creator) || Boolean(entity.adminRights) || !entity.defaultBannedRights?.sendMessages;
+}
+
 function detectType(dialog, entity) {
     if (dialog.isUser || entity.className === "User") return entity.bot ? "bot" : "user";
     if (dialog.isChannel || entity.className === "Channel") return entity.broadcast ? "channel" : "supergroup";
@@ -77,31 +97,62 @@ function detectType(dialog, entity) {
 }
 
 /**
- * Список диалогов.
+ * Список диалогов с постраничной загрузкой и защитой от FloodWait.
  * @param {import("teleproto").TelegramClient} client
- * @param {object} [opts] { limit=100, archived, query }
- * @returns {Promise<Array<object>>}
+ * @param {object} [opts] { limit=100, archived, query, offsetDate, offsetId, offsetPeer }
+ * @returns {Promise<{ dialogs: Array<object>, next: { offsetDate: number, offsetId: number, offsetPeer: string }|null }>}
  */
-export async function fetchDialogs(client, { limit = 100, archived, query } = {}) {
+export async function fetchDialogs(client, {
+    limit = 100,
+    archived,
+    query,
+    offsetDate = 0,
+    offsetId = 0,
+    offsetPeer,
+} = {}) {
     const params = { limit };
     // Только явный boolean: undefined означает «и активные, и архивные».
     if (typeof archived === "boolean") params.archived = archived;
-    const dialogs = [];
-    // Побочный, но важный эффект обхода: заодно прогревается кэш сущностей,
-    // без которого чаты по числовому ID не резолвятся после рестарта.
-    for await (const dialog of client.iterDialogs(params)) {
-        dialogs.push(normalizeDialog(dialog));
-        if (query && dialogs.length >= limit) break;
+    if (offsetId) params.offsetId = offsetId;
+    // TL ждёт секунды, клиенту наружу отдаём миллисекунды — как и везде в API.
+    if (offsetDate) params.offsetDate = Math.floor(offsetDate / 1000);
+    if (offsetPeer) params.offsetPeer = await resolveEntity(client, offsetPeer);
+
+    const raw = [];
+    const load = async () => {
+        // Побочный, но важный эффект обхода: заодно прогревается кэш
+        // сущностей, без которого чаты по числовому ID не резолвятся после
+        // рестарта.
+        for await (const dialog of client.iterDialogs(params)) raw.push(dialog);
+    };
+    try {
+        await load();
+    } catch (err) {
+        const isFlood = typeof err?.seconds === "number" || err?.errorMessage?.includes?.("FLOOD_WAIT");
+        if (!isFlood || (err.seconds || 0) > 30) throw err;
+        const wait = (err.seconds || 5) + 1;
+        await new Promise((r) => setTimeout(r, wait * 1000));
+        raw.length = 0;
+        await load();
     }
+
+    const dialogs = raw.map(normalizeDialog);
+    const next = raw.length === limit
+        ? { offsetDate: dialogs[dialogs.length - 1].date, offsetId: raw[raw.length - 1].message?.id || 0, offsetPeer: dialogs[dialogs.length - 1].id }
+        : null;
+
     // Поиска по диалогам в TL нет — фильтруем уже загруженную страницу.
     // Значит query ищет в пределах limit, а не по всему списку чатов.
     if (query) {
         const q = String(query).toLowerCase();
-        return dialogs.filter((d) =>
-            (d.title && d.title.toLowerCase().includes(q)) ||
-            (d.username && d.username.toLowerCase().includes(q)) ||
-            d.id.includes(q)
-        );
+        return {
+            dialogs: dialogs.filter((d) =>
+                (d.title && d.title.toLowerCase().includes(q)) ||
+                (d.username && d.username.toLowerCase().includes(q)) ||
+                d.id.includes(q)
+            ),
+            next,
+        };
     }
-    return dialogs;
+    return { dialogs, next };
 }

@@ -150,7 +150,9 @@ GET    /v1/accounts/:id/status                        { online, status }
 POST   /v1/accounts/:id/status                        { online } — присутствие
 
 # Диалоги и чаты
-GET    /v1/accounts/:id/dialogs?limit&archived&query
+GET    /v1/accounts/:id/dialogs?limit&archived&query&offsetDate&offsetId&offsetPeer
+                                                      -> { dialogs[], next } — у диалогов есть canPost,
+                                                      participantsCount, forum, noforwards
 GET    /v1/accounts/:id/chat/:peer                    информация о чате
 GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&offsetDate&minId&maxId&reverse
                                                       -> { messages[], nextOffsetId }

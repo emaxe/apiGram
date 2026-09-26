@@ -269,6 +269,108 @@ test("dialogs: границы прочитанного берутся из сы�
     assert.equal(bare.readOutboxMaxId, 0);
 });
 
+test("dialogs: normalizeDialog — canPost для канала зависит от прав администратора", () => {
+    const broadcastAsViewer = normalizeDialog({
+        id: { value: -100111 },
+        entity: { className: "Channel", broadcast: true, title: "Канал", forum: false, noforwards: true, participantsCount: 42 },
+    });
+    assert.equal(broadcastAsViewer.canPost, false);
+    assert.equal(broadcastAsViewer.forum, false);
+    assert.equal(broadcastAsViewer.noforwards, true);
+    assert.equal(broadcastAsViewer.participantsCount, 42);
+
+    const broadcastAsAdmin = normalizeDialog({
+        id: { value: -100112 },
+        entity: { className: "Channel", broadcast: true, adminRights: { postMessages: true } },
+    });
+    assert.equal(broadcastAsAdmin.canPost, true);
+});
+
+test("dialogs: normalizeDialog — canPost для группы смотрит на defaultBannedRights", () => {
+    const restricted = normalizeDialog({
+        id: { value: 555 },
+        entity: { className: "Chat", defaultBannedRights: { sendMessages: true } },
+    });
+    assert.equal(restricted.canPost, false);
+
+    const open = normalizeDialog({
+        id: { value: 556 },
+        entity: { className: "Chat", defaultBannedRights: { sendMessages: false } },
+    });
+    assert.equal(open.canPost, true);
+
+    const creatorBypassesRestriction = normalizeDialog({
+        id: { value: 557 },
+        entity: { className: "Chat", creator: true, defaultBannedRights: { sendMessages: true } },
+    });
+    assert.equal(creatorBypassesRestriction.canPost, true);
+});
+
+test("dialogs: normalizeDialog — личка всегда canPost, форум по умолчанию false", () => {
+    const dm = normalizeDialog({ id: { value: 1 }, entity: { className: "User", firstName: "Аня" } });
+    assert.equal(dm.canPost, true);
+    assert.equal(dm.forum, false);
+    assert.equal(dm.noforwards, false);
+    assert.equal(dm.participantsCount, null);
+});
+
+test("dialogs: fetchDialogs пробрасывает offsetDate/offsetId/offsetPeer и отдаёт next", async () => {
+    const calls = [];
+    const client = {
+        async getEntity(peer) { return { className: "User", id: 999 }; },
+        async *iterDialogs(params) {
+            calls.push(params);
+            const total = [
+                { id: { value: 1 }, entity: { className: "User", firstName: "A" }, message: { id: 1, date: 100 } },
+                { id: { value: 2 }, entity: { className: "User", firstName: "B" }, message: { id: 2, date: 200 } },
+            ];
+            for (const d of total.slice(0, params.limit)) yield d;
+        },
+    };
+    const { fetchDialogs } = await import("../src/telegram/dialogs.js");
+    const page = await fetchDialogs(client, {
+        limit: 2,
+        offsetDate: 1_700_000_000_000,
+        offsetId: 10,
+        offsetPeer: "999",
+    });
+    assert.equal(calls[0].offsetId, 10);
+    // offsetDate уходит в teleproto в секундах TL, а клиенту показываем мс —
+    // как и все остальные даты в API.
+    assert.equal(calls[0].offsetDate, 1_700_000_000);
+    assert.equal(page.dialogs.length, 2);
+    assert.equal(page.next.offsetId, 2);
+    assert.equal(page.next.offsetPeer, "2");
+});
+
+test("dialogs: fetchDialogs на пустой странице отдаёт next: null", async () => {
+    const client = { async *iterDialogs() {} };
+    const { fetchDialogs } = await import("../src/telegram/dialogs.js");
+    const page = await fetchDialogs(client, { limit: 100 });
+    assert.deepEqual(page.dialogs, []);
+    assert.equal(page.next, null);
+});
+
+test("dialogs: fetchDialogs при FloodWait короче лимита ждёт и повторяет", async () => {
+    const { FloodWaitError } = (await import("teleproto")).errors;
+    let attempt = 0;
+    const client = {
+        async *iterDialogs(params) {
+            attempt += 1;
+            if (attempt === 1) {
+                const err = new FloodWaitError({ seconds: 0 });
+                err.seconds = 1;
+                throw err;
+            }
+            yield { id: { value: 1 }, entity: { className: "User", firstName: "A" } };
+        },
+    };
+    const { fetchDialogs } = await import("../src/telegram/dialogs.js");
+    const page = await fetchDialogs(client, { limit: 40 });
+    assert.equal(attempt, 2);
+    assert.equal(page.dialogs.length, 1);
+});
+
 test("httpErrors: коды ProtocolError → HTTP-статусы, а не тотальный 500", () => {
     const notFound = toHttpError(new ProtocolError("peer_not_found", "Чат не найден."));
     assert.equal(notFound.status, 404);

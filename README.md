@@ -152,7 +152,9 @@ GET    /v1/accounts/:id/status                        { online, status }
 POST   /v1/accounts/:id/status                        { online } — presence
 
 # Dialogs and chats
-GET    /v1/accounts/:id/dialogs?limit&archived&query
+GET    /v1/accounts/:id/dialogs?limit&archived&query&offsetDate&offsetId&offsetPeer
+                                                      -> { dialogs[], next } — dialogs carry canPost,
+                                                      participantsCount, forum, noforwards
 GET    /v1/accounts/:id/chat/:peer                    chat info
 GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&offsetDate&minId&maxId&reverse
                                                       -> { messages[], nextOffsetId }
