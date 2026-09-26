@@ -180,6 +180,61 @@ test("messages: normalizeMessage сворачивает entities в JSON-safe", 
     assert.doesNotThrow(() => JSON.stringify(msg));
 });
 
+test("messages: fetchHistory принимает offsetDate/minId/maxId и отдаёт nextOffsetId", async () => {
+    const calls = [];
+    const client = {
+        async getEntity() { return { className: "User", id: 1 }; },
+        async *iterMessages(entity, params) {
+            calls.push(params);
+            const total = 3;
+            for (let i = 0; i < Math.min(params.limit, total); i++) {
+                yield { id: 100 - i, className: "Message", peerId: { value: 1 }, message: `m${i}` };
+            }
+        },
+    };
+    const { fetchHistory } = await import("../src/telegram/messages.js");
+    const page = await fetchHistory(client, "me", {
+        limit: 2,
+        offsetId: 500,
+        offsetDate: 1_700_000_000,
+        minId: 10,
+        maxId: 490,
+        reverse: false,
+    });
+    assert.equal(calls[0].offsetId, 500);
+    assert.equal(calls[0].offsetDate, 1_700_000_000);
+    assert.equal(calls[0].minId, 10);
+    assert.equal(calls[0].maxId, 490);
+    assert.equal(page.messages.length, 2);
+    // Полная страница — есть куда продолжать: nextOffsetId это id последнего
+    // (самого старого при выдаче по умолчанию) сообщения страницы.
+    assert.equal(page.nextOffsetId, 99);
+});
+
+test("messages: fetchHistory на пустой странице отдаёт nextOffsetId: null", async () => {
+    const client = {
+        async getEntity() { return { className: "User", id: 1 }; },
+        async *iterMessages() {},
+    };
+    const { fetchHistory } = await import("../src/telegram/messages.js");
+    const page = await fetchHistory(client, "me", { limit: 40 });
+    assert.deepEqual(page.messages, []);
+    assert.equal(page.nextOffsetId, null);
+});
+
+test("messages: fetchHistory неполная страница — больше некуда продолжать", async () => {
+    const client = {
+        async getEntity() { return { className: "User", id: 1 }; },
+        async *iterMessages(entity, params) {
+            yield { id: 5, className: "Message", peerId: { value: 1 }, message: "last" };
+        },
+    };
+    const { fetchHistory } = await import("../src/telegram/messages.js");
+    const page = await fetchHistory(client, "me", { limit: 40 });
+    assert.equal(page.messages.length, 1);
+    assert.equal(page.nextOffsetId, null);
+});
+
 test("dialogs: normalizeDialog отдаёт компактный объект", () => {
     const d = normalizeDialog({
         id: { value: -100789 },

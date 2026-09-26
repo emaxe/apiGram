@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Постраничная история чата: `offsetDate`, `minId`, `maxId` у `GET .../chat/:peer/history`,
+  ответ теперь `{ messages, nextOffsetId }`.
+
 ## [1.4.1] - 2026-09-10
 
 ### Added

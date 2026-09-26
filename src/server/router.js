@@ -167,13 +167,16 @@ export function buildRouter() {
     r.get("/accounts/:accountId/chat/:peer/history", async (req, res, next) => {
         try {
             const client = await getClient(req);
-            const { limit, offsetId, reverse } = req.query;
-            const history = await msg.fetchHistory(client, req.params.peer, {
+            const { limit, offsetId, offsetDate, minId, maxId, reverse } = req.query;
+            const page = await msg.fetchHistory(client, req.params.peer, {
                 limit: parseInt(limit || "40", 10),
                 offsetId: parseInt(offsetId || "0", 10),
+                offsetDate: parseInt(offsetDate || "0", 10),
+                minId: parseInt(minId || "0", 10),
+                maxId: parseInt(maxId || "0", 10),
                 reverse: reverse === "true",
             });
-            res.json({ messages: history });
+            res.json({ messages: page.messages, nextOffsetId: page.nextOffsetId });
         } catch (err) { next(err); }
     });
 

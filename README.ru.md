@@ -152,7 +152,8 @@ POST   /v1/accounts/:id/status                        { online } — прису�
 # Диалоги и чаты
 GET    /v1/accounts/:id/dialogs?limit&archived&query
 GET    /v1/accounts/:id/chat/:peer                    информация о чате
-GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&reverse
+GET    /v1/accounts/:id/chat/:peer/history?limit&offsetId&offsetDate&minId&maxId&reverse
+                                                      -> { messages[], nextOffsetId }
 
 # Сообщения
 POST   /v1/accounts/:id/chat/:peer/messages           { text, replyTo?, topMsgId?, quoteText?, quoteOffset?, parseMode?, silent?, linkPreview?, schedule? }

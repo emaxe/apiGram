@@ -140,18 +140,25 @@ function normalizeEntities(entities) {
 }
 
 /**
- * История сообщений чата с защитой от FloodWait.
+ * История сообщений чата с постраничной загрузкой и защитой от FloodWait.
  * @param {import("teleproto").TelegramClient} client
  * @param {string} rawPeer
- * @param {object} [opts] { limit=40, offsetId=0, reverse=false }
- * @returns {Promise<Array<object>>}
+ * @param {object} [opts] { limit=40, offsetId=0, offsetDate=0, minId=0, maxId=0, reverse=false }
+ * @returns {Promise<{ messages: Array<object>, nextOffsetId: number|null }>}
  */
-export async function fetchHistory(client, rawPeer, { limit = 40, offsetId = 0, reverse = false } = {}) {
+export async function fetchHistory(client, rawPeer, {
+    limit = 40,
+    offsetId = 0,
+    offsetDate = 0,
+    minId = 0,
+    maxId = 0,
+    reverse = false,
+} = {}) {
     const entity = await resolveEntity(client, rawPeer);
-    const messages = [];
+    const raw = [];
     const load = async () => {
-        for await (const msg of client.iterMessages(entity, { limit, offsetId, reverse })) {
-            if (msg && msg.className !== "MessageEmpty") messages.push(normalizeMessage(msg));
+        for await (const msg of client.iterMessages(entity, { limit, offsetId, offsetDate, minId, maxId, reverse })) {
+            if (msg && msg.className !== "MessageEmpty") raw.push(msg);
         }
     };
     try {
@@ -163,10 +170,13 @@ export async function fetchHistory(client, rawPeer, { limit = 40, offsetId = 0, 
         if (!isFlood || (err.seconds || 0) > FLOOD_WAIT_MAX_SECONDS) throw err;
         const wait = (err.seconds || 5) + 1;
         await new Promise((r) => setTimeout(r, wait * 1000));
-        messages.length = 0;
+        raw.length = 0;
         await load();
     }
-    return messages;
+    // Полная страница — есть куда продолжать; неполная (или пустая) значит
+    // «дальше пусто», и выдумывать курсор в никуда не нужно.
+    const nextOffsetId = raw.length === limit ? raw[raw.length - 1].id : null;
+    return { messages: raw.map(normalizeMessage), nextOffsetId };
 }
 
 /**

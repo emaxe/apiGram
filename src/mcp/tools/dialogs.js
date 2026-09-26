@@ -56,8 +56,8 @@ export function registerDialogTools(server, account) {
         },
         withToolError(async ({ peer, limit, offsetId, reverse }) => {
             const client = await sessionManager.getClient(account);
-            const messages = await fetchHistory(client, peer, { limit, offsetId, reverse });
-            return { content: [{ type: "text", text: JSON.stringify({ messages }, null, 2) }] };
+            const page = await fetchHistory(client, peer, { limit, offsetId, reverse });
+            return { content: [{ type: "text", text: JSON.stringify({ messages: page.messages, nextOffsetId: page.nextOffsetId }, null, 2) }] };
         })
     );
 }
