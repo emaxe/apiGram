@@ -13,6 +13,7 @@ import { sessionManager } from "../telegram/sessionManager.js";
 import * as authApi from "../telegram/auth.js";
 import * as msg from "../telegram/messages.js";
 import * as dlg from "../telegram/dialogs.js";
+import * as cp from "../telegram/copy.js";
 import * as prof from "../telegram/profile.js";
 import { createDownloadGate } from "../telegram/media.js";
 import { parseRange, mediaResponseHead } from "./range.js";
@@ -317,6 +318,24 @@ export function buildRouter() {
             if (ids.length === 0) return res.status(400).json({ error: "ids_required" });
             const sent = await msg.forwardMessages(client, req.params.peer, ids, {
                 fromPeer: req.body?.fromPeer,
+            });
+            res.json({ sent });
+        } catch (err) { next(err); }
+    });
+
+    // :peer — куда копируем, fromPeer в теле — источник. В отличие от /forward,
+    // не оставляет штампа «Переслано от»; с caption — заново отправляет вложение
+    // по ссылке на исходный файл, без пересылки как таковой.
+    r.post("/accounts/:accountId/chat/:peer/messages/copy", async (req, res, next) => {
+        try {
+            const client = await getClient(req);
+            const ids = (req.body?.msgIds || []).map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n));
+            if (ids.length === 0) return res.status(400).json({ error: "ids_required" });
+            if (!req.body?.fromPeer) return res.status(400).json({ error: "peer_required" });
+            const sent = await cp.copyMessages(client, req.params.peer, ids, {
+                fromPeer: req.body.fromPeer,
+                caption: req.body.caption,
+                parseMode: req.body.parseMode,
             });
             res.json({ sent });
         } catch (err) { next(err); }

@@ -482,6 +482,67 @@ test("httpErrors: коды ProtocolError → HTTP-статусы, а не тот
     assert.equal(toHttpError(new Error("что-то пошло не так")).status, 500);
 });
 
+test("httpErrors: protected_content -> 409", () => {
+    const err = toHttpError(new ProtocolError("protected_content", "Источник запрещает пересылку."));
+    assert.equal(err.status, 409);
+    assert.equal(err.body.error, "protected_content");
+});
+
+test("copy: без подписи копирует через forwardMessages с dropAuthor", async () => {
+    const calls = { forward: [], sendFile: [] };
+    const client = {
+        async getEntity(peer) { return { className: "Channel", id: 1, noforwards: false }; },
+        async getMessages(entity, { ids }) {
+            return ids.map((id) => ({ id, media: null }));
+        },
+        async forwardMessages(entity, params) {
+            calls.forward.push(params);
+            return params.messages.map((id) => ({ id: id + 1000, message: "" }));
+        },
+        async sendFile() { calls.sendFile.push(true); throw new Error("не должен вызываться"); },
+    };
+    const { copyMessages } = await import("../src/telegram/copy.js");
+    const sent = await copyMessages(client, "target", [1, 2], { fromPeer: "source" });
+    assert.equal(calls.forward.length, 1);
+    assert.equal(calls.forward[0].dropAuthor, true);
+    assert.equal(calls.sendFile.length, 0);
+    assert.equal(sent.length, 2);
+});
+
+test("copy: с подписью использует media исходных сообщений через sendFile", async () => {
+    const media = { className: "MessageMediaPhoto", photo: { className: "Photo", id: 777 } };
+    const client = {
+        async getEntity(peer) { return { className: "Channel", id: 1, noforwards: false }; },
+        async getMessages(entity, { ids }) {
+            return ids.map((id) => ({ id, media }));
+        },
+        async forwardMessages() { throw new Error("не должен вызываться при наличии caption"); },
+        async sendFile(entity, params) {
+            assert.equal(params.file, media);
+            assert.equal(params.caption, "подпись");
+            return { id: 999, message: "подпись" };
+        },
+    };
+    const { copyMessages } = await import("../src/telegram/copy.js");
+    const sent = await copyMessages(client, "target", [1], { fromPeer: "source", caption: "подпись" });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].text, "подпись");
+});
+
+test("copy: noforwards у источника — protected_content, sendFile/forward не вызываются", async () => {
+    const client = {
+        async getEntity(peer) { return { className: "Channel", id: 1, noforwards: true }; },
+        async getMessages() { throw new Error("не должен вызываться — проверка noforwards идёт раньше"); },
+        async forwardMessages() { throw new Error("не должен вызываться"); },
+        async sendFile() { throw new Error("не должен вызываться"); },
+    };
+    const { copyMessages } = await import("../src/telegram/copy.js");
+    await assert.rejects(
+        () => copyMessages(client, "target", [1], { fromPeer: "source" }),
+        (err) => err instanceof ProtocolError && err.code === "protected_content"
+    );
+});
+
 test("serialize: toPlain обезвреживает BigInt, Buffer, Date и методы", () => {
     const plain = toPlain({
         className: "Message",

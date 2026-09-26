@@ -171,6 +171,8 @@ DELETE /v1/accounts/:id/chat/:peer/messages/:msgId/pin     unpin message
 DELETE /v1/accounts/:id/chat/:peer/pin?topMsgId=           unpin all messages (or in topic)
 POST   /v1/accounts/:id/chat/:peer/read               { maxId }
 POST   /v1/accounts/:id/chat/:peer/forward            { ids, fromPeer }
+POST   /v1/accounts/:id/chat/:peer/messages/copy      { fromPeer, msgIds[], caption?, parseMode? }
+                                                      no forward stamp; noforwards source -> 409 protected_content
 GET    /v1/accounts/:id/chat/:peer/avatar?size=small|big   download avatar (ETag)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    download media (Range)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/thumb?size=s|m   thumbnail (ETag)

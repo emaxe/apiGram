@@ -169,6 +169,8 @@ DELETE /v1/accounts/:id/chat/:peer/messages/:msgId/pin     открепить с
 DELETE /v1/accounts/:id/chat/:peer/pin?topMsgId=           открепить все сообщения (или в топике)
 POST   /v1/accounts/:id/chat/:peer/read               { maxId }
 POST   /v1/accounts/:id/chat/:peer/forward            { ids, fromPeer }
+POST   /v1/accounts/:id/chat/:peer/messages/copy      { fromPeer, msgIds[], caption?, parseMode? }
+                                                      без штампа «Переслано от»; noforwards источника -> 409 protected_content
 GET    /v1/accounts/:id/chat/:peer/avatar?size=small|big   скачать аватар чата/пользователя (ETag)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/file    скачать медиа (Range)
 GET    /v1/accounts/:id/chat/:peer/messages/:msgId/thumb?size=s|m   превью (ETag)
