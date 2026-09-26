@@ -72,20 +72,25 @@ export function attachWs(httpServer) {
         bus.on("account_event", listener);
         socket.on("close", () => bus.off("account_event", listener));
 
+        // hello идёт первым кадром: клиенту нужен streamId раньше хвоста, чтобы
+        // понять, к какому потоку относятся seq переотправленных событий.
+        socket.send(stringify({ accountEvent: true, type: "hello", accountId, streamId: buffer.streamId, latestSeq: buffer.latestSeq() }));
+
         const sinceParam = url.searchParams.get("since");
-        if (sinceParam !== null) {
-            const sinceSeq = parseInt(sinceParam, 10);
+        const streamParam = url.searchParams.get("stream") || undefined;
+        if (sinceParam !== null || streamParam) {
+            const sinceSeq = sinceParam === null ? buffer.latestSeq() : parseInt(sinceParam, 10);
             if (!Number.isNaN(sinceSeq)) {
-                const { events, gap } = buffer.tail(sinceSeq);
+                const { events, gap } = buffer.resume(sinceSeq, streamParam);
                 if (gap && socket.readyState === socket.OPEN) {
-                    socket.send(stringify({ accountEvent: true, type: "since_gap", accountId, latestSeq: buffer.latestSeq() }));
+                    socket.send(stringify({ accountEvent: true, type: "since_gap", accountId, streamId: buffer.streamId, latestSeq: buffer.latestSeq() }));
                 }
                 for (const event of events) {
                     if (socket.readyState === socket.OPEN) socket.send(stringify(event));
                 }
             }
         }
-        socket.send(stringify({ accountEvent: true, type: "connected", accountId, seq: buffer.latestSeq() }));
+        socket.send(stringify({ accountEvent: true, type: "connected", accountId, streamId: buffer.streamId, seq: buffer.latestSeq() }));
     });
 
     // Отстрел мёртвых соединений: без этого повисшие сокеты копятся до перезапуска.

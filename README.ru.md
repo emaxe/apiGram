@@ -205,7 +205,7 @@ downloadable}`. Размеры известны до загрузки — заг
 ## WebSocket
 
 ```
-ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>&since=<seq>
+ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>&since=<seq>&stream=<streamId>
 ```
 
 Подключение поднимает клиента Telegram для аккаунта, если он ещё не поднят.
@@ -216,12 +216,19 @@ ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>&since=<seq>
 аккаунт; если хвост уже вытеснен, вместо тихого пропуска клиент получает
 `since_gap` (`latestSeq`) и должен долить историю через REST.
 
+`stream=<streamId>` (опционально, вместе с `since`): `seq` снова считается с 1
+при каждом пересоздании буфера (рестарт процесса), поэтому голый `since` из
+прошлого запуска может указывать на совсем другие события. Первый кадр любого
+подключения — `hello` с текущим `streamId`; его нужно хранить рядом с курсором и
+передавать обратно. При несовпадении сервер шлёт `since_gap` и отдаёт весь буфер.
+
 События (`JSON`, все с `accountEvent: true`):
 
 | `type` | Полезная нагрузка |
 |---|---|
-| `connected` | `accountId`, `seq` — подтверждение подписки, последний seq в буфере |
-| `since_gap` | `accountId`, `latestSeq` — буфер уже не покрывает запрошенный диапазон `since` |
+| `hello` | `accountId`, `streamId`, `latestSeq` — всегда первый кадр, идентифицирует поток `seq` |
+| `connected` | `accountId`, `streamId`, `seq` — подтверждение подписки, последний seq в буфере |
+| `since_gap` | `accountId`, `streamId`, `latestSeq` — буфер уже не покрывает запрошенный диапазон `since` или `stream` из другого запуска |
 | `new_message` / `edited_message` | `message` — нормализованное сообщение |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |

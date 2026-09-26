@@ -147,6 +147,31 @@ test("eventBuffer: since больше latestSeq — gap (например, пр�
     assert.equal(withSomeEvents.gap, true);
 });
 
+test("eventBuffer: у каждого буфера свой streamId", () => {
+    const a = new AccountEventBuffer(10);
+    const b = new AccountEventBuffer(10);
+    assert.equal(typeof a.streamId, "string");
+    assert.ok(a.streamId.length > 0);
+    assert.notEqual(a.streamId, b.streamId);
+});
+
+test("eventBuffer: resume с чужим streamId отдаёт весь буфер с gap, даже если since меньше latestSeq", () => {
+    // Процесс перезапустился и успел набрать seq выше курсора клиента: по одному
+    // since это неотличимо от обычного переподключения, различает только streamId.
+    const buffer = new AccountEventBuffer(10);
+    for (const type of ["a", "b", "c", "d"]) buffer.push({ type });
+    const { events, gap } = buffer.resume(2, "stream-from-previous-process");
+    assert.equal(gap, true);
+    assert.deepEqual(events.map((e) => e.type), ["a", "b", "c", "d"]);
+});
+
+test("eventBuffer: resume со своим streamId или без него ведёт себя как tail", () => {
+    const buffer = new AccountEventBuffer(10);
+    for (const type of ["a", "b", "c"]) buffer.push({ type });
+    assert.deepEqual(buffer.resume(1, buffer.streamId), buffer.tail(1));
+    assert.deepEqual(buffer.resume(1), buffer.tail(1));
+});
+
 test("eventBuffer: attach проставляет seq раньше остальных слушателей канала", () => {
     const channel = new EventEmitter();
     const buffer = new AccountEventBuffer(10);
@@ -2922,15 +2947,21 @@ test("ws: переподключение с ?since= отдаёт хвост бу
         await new Promise((resolve, reject) => {
             ws.on("message", (data) => {
                 received.push(JSON.parse(data.toString()));
-                if (received.length >= 2) resolve();
+                if (received.length >= 3) resolve();
             });
             ws.on("error", reject);
             setTimeout(() => reject(new Error("timeout waiting for buffered tail")), 2000);
         });
 
-        // Первым уходит хвост буфера (seq=2, «1» уже видели), потом — connected.
-        assert.equal(received[0].text, "2");
-        assert.equal(received[0].seq, 2);
+        // Первым — hello со streamId, затем хвост буфера (seq=2, «1» уже видели),
+        // потом — connected.
+        const buffer = sessionManager.eventBuffer(account.accountId);
+        assert.equal(received[0].type, "hello");
+        assert.equal(received[0].streamId, buffer.streamId);
+        assert.equal(received[1].text, "2");
+        assert.equal(received[1].seq, 2);
+        assert.equal(received[2].type, "connected");
+        assert.equal(received[2].streamId, buffer.streamId);
     } finally {
         // Незакрытый клиентский сокет держит HTTP-сервер живым: server.close()
         // ждёт разрыва всех соединений и не вызовет колбэк, пока WS открыт —
@@ -2985,6 +3016,53 @@ test("ws: since старше вытесненного диапазона буф�
     } finally {
         // См. комментарий в предыдущем тесте: закрыть сокет ДО server.close(),
         // иначе висящее соединение не даёт колбэку close сработать на RED.
+        ws?.close();
+        sessionManager.getClient = originalGetClient;
+        sessionManager.channels.delete(account.accountId);
+        sessionManager.eventBuffers.delete(account.accountId);
+        deleteAccount(account.accountId);
+        await new Promise((resolve) => server.close(resolve));
+    }
+});
+
+test("ws: stream от прошлого буфера — since_gap и весь буфер, даже если since меньше latestSeq", async () => {
+    const { attachWs } = await import("../src/server/ws.js");
+    const http = await import("node:http");
+    const WebSocket = (await import("ws")).default;
+
+    const account = createAccount("ws-stream-test");
+    updateAccount(account.accountId, { status: "authorized" });
+    const originalGetClient = sessionManager.getClient;
+    sessionManager.getClient = async () => ({});
+
+    const server = http.createServer();
+    attachWs(server);
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address();
+
+    let ws;
+    try {
+        // Рестарт процесса: новый буфер уже набрал seq 1..3, а клиент помнит
+        // since=1 из прошлого потока. По since это обычный хвост — только
+        // несовпадение stream показывает, что seq 1 здесь совсем другое событие.
+        const bus = sessionManager.channel(account.accountId);
+        for (const text of ["1", "2", "3"]) bus.emit("account_event", { accountEvent: true, type: "new_message", text });
+
+        const url = `ws://127.0.0.1:${port}/v1/ws?accountId=${account.accountId}&token=${account.apiToken}&since=1&stream=previous-stream`;
+        ws = new WebSocket(url);
+        const received = [];
+        await new Promise((resolve, reject) => {
+            ws.on("message", (data) => {
+                received.push(JSON.parse(data.toString()));
+                if (received.some((e) => e.type === "connected")) resolve();
+            });
+            ws.on("error", reject);
+            setTimeout(() => reject(new Error("timeout waiting for connected")), 2000);
+        });
+
+        assert.deepEqual(received.map((e) => e.type), ["hello", "since_gap", "new_message", "new_message", "new_message", "connected"]);
+        assert.deepEqual(received.filter((e) => e.type === "new_message").map((e) => e.seq), [1, 2, 3]);
+    } finally {
         ws?.close();
         sessionManager.getClient = originalGetClient;
         sessionManager.channels.delete(account.accountId);

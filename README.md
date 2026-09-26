@@ -207,7 +207,7 @@ came `chatId` (always marked), `groupedId` (albums), `fwdFrom`, `viaBotId` and
 ## WebSocket
 
 ```
-ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>&since=<seq>
+ws://127.0.0.1:3111/v1/ws?accountId=<id>&token=<apiToken>&since=<seq>&stream=<streamId>
 ```
 
 Connecting spins up the Telegram client for the account if it is not running yet.
@@ -218,12 +218,19 @@ before the live stream. The buffer holds the last 500 events per account; if it
 no longer covers the gap, the client gets `since_gap` (`latestSeq`) instead of a
 silent hole and must backfill via REST.
 
+`stream=<streamId>` (optional, with `since`): `seq` restarts from 1 whenever the
+buffer is recreated (process restart), so a bare `since` from a previous run can
+point at unrelated events. The first frame of every connection is `hello` with the
+current `streamId`; store it next to the cursor and pass it back. If it does not
+match, the server sends `since_gap` and replays the whole buffer.
+
 Events (`JSON`, every one carries `accountEvent: true`):
 
 | `type` | Payload |
 |---|---|
-| `connected` | `accountId`, `seq` — subscription confirmed, latest buffered seq |
-| `since_gap` | `accountId`, `latestSeq` — buffer no longer covers the requested `since` range |
+| `hello` | `accountId`, `streamId`, `latestSeq` — always the first frame, identifies the `seq` stream |
+| `connected` | `accountId`, `streamId`, `seq` — subscription confirmed, latest buffered seq |
+| `since_gap` | `accountId`, `streamId`, `latestSeq` — buffer no longer covers the requested `since` range, or `stream` is from another run |
 | `new_message` / `edited_message` | `message` — normalized message |
 | `deleted_messages` | `peerId`, `deletedIds` |
 | `typing` | `chatId`, `userId`, `action` |

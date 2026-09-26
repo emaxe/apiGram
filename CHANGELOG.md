@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `AUTOCONNECT_ACCOUNTS=true` подключает аккаунты с сохранённой сессией при старте.
 - WebSocket принимает `?since=<seq>`: кольцевой буфер (500 событий на аккаунт) отдаёт
   хвост при переподключении; `since_gap`, если хвост уже вытеснен.
+- WebSocket: первый кадр `hello` со `streamId` буфера; `?stream=<streamId>` при
+  переподключении — если поток сменился (рестарт процесса), `since_gap` и весь буфер
+  вместо хвоста по чужому `seq`. `streamId` добавлен в `connected` и `since_gap`.
 - `POST .../chat/:peer/messages/copy`: копирование без штампа «Переслано от»;
   `noforwards` источника -> 409 `protected_content`.
 

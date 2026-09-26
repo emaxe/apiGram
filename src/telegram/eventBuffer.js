@@ -6,7 +6,14 @@
  * потеряются молча. Буфер держит только последние `size` событий на аккаунт —
  * дальше это не гарантия доставки, а окно; за его пределами клиенту нужно
  * долить историю через REST (backfill/gap-sync в `fabrika`).
+ *
+ * `seq` уникален только внутри одного буфера: новый буфер (рестарт процесса,
+ * пересоздание аккаунта) снова считает с единицы. Поэтому у буфера есть
+ * `streamId` — клиент хранит пару (`streamId`, `seq`) и по несовпадению
+ * `streamId` понимает, что его курсор относится к другому потоку.
  */
+
+import crypto from "node:crypto";
 
 const DEFAULT_SIZE = 500;
 
@@ -17,6 +24,8 @@ export class AccountEventBuffer {
         /** @type {Array<object>} */
         this.events = [];
         this.seq = 0;
+        /** Идентификатор потока `seq` этого буфера. */
+        this.streamId = crypto.randomUUID();
     }
 
     /**
@@ -60,6 +69,22 @@ export class AccountEventBuffer {
             return { events: this.events.slice(), gap: true };
         }
         return { events: this.events.filter((e) => e.seq > sinceSeq), gap: false };
+    }
+
+    /**
+     * Хвост для переподключающегося клиента. Если клиент прислал `streamId`
+     * другого буфера, его `sinceSeq` из чужого счётчика и сравнивать его с нашим
+     * нельзя: отдаём весь буфер с `gap` — события между потоками потеряны.
+     * Без `streamId` (старый клиент) — прежнее поведение `tail`.
+     * @param {number} sinceSeq
+     * @param {string} [clientStreamId]
+     * @returns {{ events: Array<object>, gap: boolean }}
+     */
+    resume(sinceSeq, clientStreamId) {
+        if (clientStreamId && clientStreamId !== this.streamId) {
+            return { events: this.events.slice(), gap: true };
+        }
+        return this.tail(sinceSeq);
     }
 
     /**
